@@ -1,0 +1,89 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  font-family: "PingFang SC", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+  line-height: 1.6;
+  font-weight: 400;
+  color-scheme: light;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background-color: #f8fafc;
+  color: #1e293b;
+}
+
+/* 滚动条 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: #f1f5f9;
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+@layer components {
+  /* 面板 */
+  .cyber-panel {
+    @apply bg-white border border-slate-200 rounded-lg shadow-card;
+  }
+
+  /* 按钮 */
+  .cyber-btn {
+    @apply px-5 py-2 font-medium text-sm rounded-md border transition-all duration-200 cursor-pointer inline-flex items-center justify-center gap-1.5;
+  }
+  .cyber-btn-primary {
+    @apply cyber-btn bg-cyber-cyan text-white border-cyber-cyan hover:bg-blue-700 hover:border-blue-700;
+  }
+  .cyber-btn-magenta {
+    @apply cyber-btn bg-white text-cyber-magenta border-cyber-magenta hover:bg-sky-50;
+  }
+  .cyber-btn-green {
+    @apply cyber-btn bg-cyber-green text-white border-cyber-green hover:bg-green-700;
+  }
+  .cyber-btn-purple {
+    @apply cyber-btn bg-cyber-purple text-white border-cyber-purple hover:bg-purple-700;
+  }
+
+  /* 文字色 */
+  .neon-text-cyan {
+    color: #2563eb;
+  }
+  .neon-text-magenta {
+    color: #0ea5e9;
+  }
+  .neon-text-green {
+    color: #16a34a;
+  }
+
+  /* 状态标签 */
+  .status-badge {
+    @apply inline-flex items-center px-2 py-0.5 rounded text-xs font-medium;
+  }
+  .status-pass {
+    @apply status-badge bg-green-50 text-green-700 border border-green-200;
+  }
+  .status-warn {
+    @apply status-badge bg-amber-50 text-amber-700 border border-amber-200;
+  }
+  .status-fail {
+    @apply status-badge bg-red-50 text-red-700 border border-red-200;
+  }
+  .status-none {
+    @apply status-badge bg-slate-100 text-slate-500 border border-slate-200;
+  }
+}
