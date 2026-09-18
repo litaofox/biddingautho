@@ -2,14 +2,14 @@
 import { ref, computed } from "vue";
 import {
   Download, FileCheck, CheckCircle2, RotateCcw, Bot, ShieldCheck,
-  XCircle, Star, ScrollText
 } from "lucide-vue-next";
-import { exportReport } from "@/api";
-import type { UnifiedReviewResult, LLMReviewResult } from "@/types";
+import { exportReport, exportMultiDimReport } from "@/api";
+import type { UnifiedReviewResult, ReviewMode } from "@/types";
 
 const props = defineProps<{
   sessionId: string;
   result: UnifiedReviewResult | null;
+  mode: ReviewMode;
 }>();
 
 const emit = defineEmits<{
@@ -17,10 +17,7 @@ const emit = defineEmits<{
   (e: "restart"): void;
 }>();
 
-const isLLMMode = computed(() => props.result?.mode === "llm");
-const llmResult = computed<LLMReviewResult | null>(
-  () => (props.result?.mode === "llm" ? (props.result as LLMReviewResult) : null)
-);
+const isLLMMode = computed(() => props.mode === "llm");
 
 const exportOptions = ref({
   complianceTable: true,
@@ -31,19 +28,34 @@ const exportOptions = ref({
   analysisLog: true,
 });
 
+// LLM 两阶段流程只产出多维审核结果（multiDimResult），导出走 8 章多维报告
+const multiDimOptions = ref({
+  summary: true,
+  critical: true,
+  major: true,
+  minor: true,
+  highlights: true,
+  remediation: true,
+  manualCheck: true,
+  completeness: true,
+});
+
 const isExporting = ref(false);
 const isExported = ref(false);
 const errorMsg = ref("");
 
-const selectedCount = computed(() =>
+const legacySelectedCount = computed(() =>
   Object.values(exportOptions.value).filter(Boolean).length
+);
+const multiDimSelectedCount = computed(() =>
+  Object.values(multiDimOptions.value).filter(Boolean).length
+);
+const selectedCount = computed(() =>
+  isLLMMode.value ? multiDimSelectedCount.value : legacySelectedCount.value
 );
 
 const bidderCount = computed(() => props.result?.bidders.length || 0);
 const itemCount = computed(() => props.result?.complianceTable.length || 0);
-const rejectionCount = computed(() => llmResult.value?.rejection.items.length || 0);
-const scoringCount = computed(() => llmResult.value?.scoringItems.length || 0);
-const logCount = computed(() => llmResult.value?.analysisLog.length || 0);
 
 async function handleExport() {
   if (selectedCount.value === 0 || isExporting.value) return;
@@ -52,19 +64,28 @@ async function handleExport() {
   errorMsg.value = "";
 
   try {
-    const blob = await exportReport(props.sessionId, {
-      complianceTable: exportOptions.value.complianceTable,
-      comparisonDetails: exportOptions.value.comparisonDetails,
-      evaluation: exportOptions.value.evaluation,
-      rejection: isLLMMode.value ? exportOptions.value.rejection : undefined,
-      scoring: isLLMMode.value ? exportOptions.value.scoring : undefined,
-      analysisLog: isLLMMode.value ? exportOptions.value.analysisLog : undefined,
-    });
+    let blob: Blob;
+    let filename: string;
+    const date = new Date().toISOString().slice(0, 10);
+    if (isLLMMode.value) {
+      // LLM 两阶段：导出 8 章全方位审核报告
+      blob = await exportMultiDimReport(props.sessionId, { ...multiDimOptions.value });
+      filename = `投标文件全方位审核报告_LLM_${date}.html`;
+    } else {
+      blob = await exportReport(props.sessionId, {
+        complianceTable: exportOptions.value.complianceTable,
+        comparisonDetails: exportOptions.value.comparisonDetails,
+        evaluation: exportOptions.value.evaluation,
+        rejection: exportOptions.value.rejection,
+        scoring: exportOptions.value.scoring,
+        analysisLog: exportOptions.value.analysisLog,
+      });
+      filename = `审查报告_本地审核_${date}.html`;
+    }
     const url = window.URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    const modeSuffix = isLLMMode.value ? "LLM审核" : "本地审核";
-    a.download = `审查报告_${modeSuffix}_${new Date().toISOString().slice(0, 10)}.html`;
+    a.download = filename;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -105,7 +126,8 @@ async function handleExport() {
     <div class="cyber-panel p-6">
       <h3 class="font-semibold text-slate-700 mb-4">导出内容</h3>
 
-      <div class="space-y-3">
+      <!-- 本地规则审核：旧版符合性审查报告选项 -->
+      <div v-if="!isLLMMode" class="space-y-3">
         <label class="flex items-center gap-3 p-4 rounded-lg border border-slate-200 cursor-pointer hover:border-cyber-cyan/50 transition-colors" :class="{ 'bg-blue-50 border-cyber-cyan/40': exportOptions.complianceTable }">
           <input type="checkbox" v-model="exportOptions.complianceTable" class="w-5 h-5 accent-cyber-cyan" />
           <div>
@@ -129,54 +151,66 @@ async function handleExport() {
             <p class="text-xs text-slate-400">综合评分、风险提示与建议结论</p>
           </div>
         </label>
+      </div>
 
-        <!-- LLM 模式专属选项 -->
-        <template v-if="isLLMMode">
-          <label
-            v-if="rejectionCount > 0"
-            class="flex items-center gap-3 p-4 rounded-lg border border-slate-200 cursor-pointer hover:border-red-300/50 transition-colors"
-            :class="{ 'bg-red-50 border-red-300/40': exportOptions.rejection }"
-          >
-            <input type="checkbox" v-model="exportOptions.rejection" class="w-5 h-5 accent-red-500" />
-            <div class="flex items-center gap-2">
-              <XCircle class="w-4 h-4 text-red-500" />
-              <div>
-                <p class="text-slate-700">废标项分析</p>
-                <p class="text-xs text-slate-400">共 {{ rejectionCount }} 项废标条件及各投标人触发情况</p>
-              </div>
-            </div>
-          </label>
-
-          <label
-            v-if="scoringCount > 0"
-            class="flex items-center gap-3 p-4 rounded-lg border border-slate-200 cursor-pointer hover:border-amber-300/50 transition-colors"
-            :class="{ 'bg-amber-50 border-amber-300/40': exportOptions.scoring }"
-          >
-            <input type="checkbox" v-model="exportOptions.scoring" class="w-5 h-5 accent-amber-500" />
-            <div class="flex items-center gap-2">
-              <Star class="w-4 h-4 text-amber-500" />
-              <div>
-                <p class="text-slate-700">评分项与模拟打分</p>
-                <p class="text-xs text-slate-400">共 {{ scoringCount }} 项评分标准及各投标人模拟得分</p>
-              </div>
-            </div>
-          </label>
-
-          <label
-            v-if="logCount > 0"
-            class="flex items-center gap-3 p-4 rounded-lg border border-slate-200 cursor-pointer hover:border-slate-400/50 transition-colors"
-            :class="{ 'bg-slate-50 border-slate-400/40': exportOptions.analysisLog }"
-          >
-            <input type="checkbox" v-model="exportOptions.analysisLog" class="w-5 h-5 accent-slate-600" />
-            <div class="flex items-center gap-2">
-              <ScrollText class="w-4 h-4 text-slate-600" />
-              <div>
-                <p class="text-slate-700">分析过程日志</p>
-                <p class="text-xs text-slate-400">共 {{ logCount }} 条 AI 分析记录，结果可追溯</p>
-              </div>
-            </div>
-          </label>
-        </template>
+      <!-- LLM 智能审核：8 章全方位审核报告选项 -->
+      <div v-else class="space-y-3">
+        <label class="flex items-center gap-3 p-4 rounded-lg border border-slate-200 cursor-pointer hover:border-purple-300/50 transition-colors" :class="{ 'bg-purple-50 border-purple-300/40': multiDimOptions.summary }">
+          <input type="checkbox" v-model="multiDimOptions.summary" class="w-5 h-5 accent-purple-500" />
+          <div>
+            <p class="text-slate-700">整体核查结论</p>
+            <p class="text-xs text-slate-400">风险分级汇总与总体结论</p>
+          </div>
+        </label>
+        <label class="flex items-center gap-3 p-4 rounded-lg border border-slate-200 cursor-pointer hover:border-red-300/50 transition-colors" :class="{ 'bg-red-50 border-red-300/40': multiDimOptions.critical }">
+          <input type="checkbox" v-model="multiDimOptions.critical" class="w-5 h-5 accent-red-500" />
+          <div>
+            <p class="text-slate-700">准高危问题</p>
+            <p class="text-xs text-slate-400">可能导致无效投标的关键问题清单</p>
+          </div>
+        </label>
+        <label class="flex items-center gap-3 p-4 rounded-lg border border-slate-200 cursor-pointer hover:border-orange-300/50 transition-colors" :class="{ 'bg-orange-50 border-orange-300/40': multiDimOptions.major }">
+          <input type="checkbox" v-model="multiDimOptions.major" class="w-5 h-5 accent-orange-500" />
+          <div>
+            <p class="text-slate-700">扣分项问题</p>
+            <p class="text-xs text-slate-400">影响评审得分的实质性问题</p>
+          </div>
+        </label>
+        <label class="flex items-center gap-3 p-4 rounded-lg border border-slate-200 cursor-pointer hover:border-amber-300/50 transition-colors" :class="{ 'bg-amber-50 border-amber-300/40': multiDimOptions.minor }">
+          <input type="checkbox" v-model="multiDimOptions.minor" class="w-5 h-5 accent-amber-500" />
+          <div>
+            <p class="text-slate-700">细节优化项</p>
+            <p class="text-xs text-slate-400">文本、格式等细节问题</p>
+          </div>
+        </label>
+        <label class="flex items-center gap-3 p-4 rounded-lg border border-slate-200 cursor-pointer hover:border-emerald-300/50 transition-colors" :class="{ 'bg-emerald-50 border-emerald-300/40': multiDimOptions.highlights }">
+          <input type="checkbox" v-model="multiDimOptions.highlights" class="w-5 h-5 accent-emerald-500" />
+          <div>
+            <p class="text-slate-700">合规亮点</p>
+            <p class="text-xs text-slate-400">响应到位、可加分的内容</p>
+          </div>
+        </label>
+        <label class="flex items-center gap-3 p-4 rounded-lg border border-slate-200 cursor-pointer hover:border-indigo-300/50 transition-colors" :class="{ 'bg-indigo-50 border-indigo-300/40': multiDimOptions.completeness }">
+          <input type="checkbox" v-model="multiDimOptions.completeness" class="w-5 h-5 accent-indigo-500" />
+          <div>
+            <p class="text-slate-700">完整性对照</p>
+            <p class="text-xs text-slate-400">采购文件要求材料与投标文件逐项对照</p>
+          </div>
+        </label>
+        <label class="flex items-center gap-3 p-4 rounded-lg border border-slate-200 cursor-pointer hover:border-pink-300/50 transition-colors" :class="{ 'bg-pink-50 border-pink-300/40': multiDimOptions.remediation }">
+          <input type="checkbox" v-model="multiDimOptions.remediation" class="w-5 h-5 accent-pink-500" />
+          <div>
+            <p class="text-slate-700">整改清单（P0/P1/P2）</p>
+            <p class="text-xs text-slate-400">按优先级组织的整改建议</p>
+          </div>
+        </label>
+        <label class="flex items-center gap-3 p-4 rounded-lg border border-slate-200 cursor-pointer hover:border-slate-400/50 transition-colors" :class="{ 'bg-slate-50 border-slate-400/40': multiDimOptions.manualCheck }">
+          <input type="checkbox" v-model="multiDimOptions.manualCheck" class="w-5 h-5 accent-slate-600" />
+          <div>
+            <p class="text-slate-700">人工核查事项</p>
+            <p class="text-xs text-slate-400">证照、签章等图片材料需人工确认的事项</p>
+          </div>
+        </label>
       </div>
     </div>
 
@@ -191,25 +225,21 @@ async function handleExport() {
           <span class="text-slate-400">审核模式：</span>
           <span class="text-slate-700">{{ isLLMMode ? 'LLM 智能审核' : '本地规则审核' }}</span>
         </div>
-        <div>
+        <div v-if="!isLLMMode">
           <span class="text-slate-400">投标公司数：</span>
           <span class="text-slate-700">{{ bidderCount }} 家</span>
         </div>
-        <div>
+        <div v-if="!isLLMMode">
           <span class="text-slate-400">审查项数：</span>
           <span class="text-slate-700">{{ itemCount }} 项</span>
         </div>
-        <div v-if="isLLMMode">
-          <span class="text-slate-400">废标项数：</span>
-          <span class="text-slate-700">{{ rejectionCount }} 项</span>
-        </div>
-        <div v-if="isLLMMode">
-          <span class="text-slate-400">评分项数：</span>
-          <span class="text-slate-700">{{ scoringCount }} 项</span>
-        </div>
-        <div>
+        <div v-if="!isLLMMode">
           <span class="text-slate-400">综合评分：</span>
           <span class="text-slate-700">{{ result?.evaluation.score }} 分</span>
+        </div>
+        <div v-if="isLLMMode">
+          <span class="text-slate-400">报告类型：</span>
+          <span class="text-slate-700">投标文件全方位审核报告（8 章）</span>
         </div>
         <div>
           <span class="text-slate-400">导出时间：</span>

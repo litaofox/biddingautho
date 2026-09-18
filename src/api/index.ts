@@ -1,5 +1,9 @@
 // 前端 API 封装
-import type { ReviewConfig, ReviewItem, ReviewItemSet, UnifiedReviewResult } from "../types";
+import type {
+  ReviewConfig, ReviewItem, ReviewItemSet, UnifiedReviewResult,
+  MultiDimConfig, MultiDimReviewResult,
+  Issue, RemediationPlan, CompletenessItem, AuditPlan,
+} from "../types";
 
 const BASE_URL = "/api";
 
@@ -127,4 +131,127 @@ export async function exportReport(
   });
   if (!res.ok) throw new Error("导出失败");
   return res.blob();
+}
+
+// ========== 多维审核 API（F1-F10） ==========
+
+// 执行多维审核
+export async function runMultiDimReview(
+  sessionId: string,
+  config?: MultiDimConfig
+): Promise<MultiDimReviewResult> {
+  const res = await fetch(`${BASE_URL}/review2/multi-dim`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionId, config }),
+  });
+  const json = await res.json();
+  if (!json.success) throw new Error(json.error);
+  return json.result;
+}
+
+// 获取多维审核问题列表（按风险等级分组）
+export async function getMultiDimIssues(sessionId: string): Promise<{
+  critical: Issue[];
+  major: Issue[];
+  minor: Issue[];
+  highlights: Issue[];
+  summary: MultiDimReviewResult["summary"];
+}> {
+  const res = await fetch(`${BASE_URL}/review2/issues/${sessionId}`);
+  const json = await res.json();
+  if (!json.success) throw new Error(json.error);
+  return {
+    critical: json.critical,
+    major: json.major,
+    minor: json.minor,
+    highlights: json.highlights,
+    summary: json.summary,
+  };
+}
+
+// 获取整改清单
+export async function getRemediationPlan(sessionId: string): Promise<{
+  remediationPlan: RemediationPlan;
+  completeness: CompletenessItem[];
+  summary: MultiDimReviewResult["summary"];
+  highlights: Issue[];
+  issues: Issue[];
+  bidders: string[];
+  mode: string;
+  procurement: string;
+  createdAt: number;
+  generatedAt: number;
+}> {
+  const res = await fetch(`${BASE_URL}/review2/remediation/${sessionId}`);
+  const json = await res.json();
+  if (!json.success) throw new Error(json.error);
+  return json;
+}
+
+// 导出多维审核 HTML 报告
+export async function exportMultiDimReport(
+  sessionId: string,
+  options?: {
+    summary?: boolean;
+    critical?: boolean;
+    major?: boolean;
+    minor?: boolean;
+    highlights?: boolean;
+    remediation?: boolean;
+    manualCheck?: boolean;
+    completeness?: boolean;
+  }
+): Promise<Blob> {
+  const res = await fetch(`${BASE_URL}/review2/export`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionId, options: options || {} }),
+  });
+  if (!res.ok) throw new Error("多维报告导出失败");
+  return res.blob();
+}
+
+// ========== LLM 全方位审核（两阶段） ==========
+
+// 阶段一：根据采购文件+需求动态生成审核清单
+export async function generateAuditPlan(
+  sessionId: string,
+  data: { provider: string; apiKey: string }
+): Promise<{ plan: AuditPlan; message: string }> {
+  const res = await fetch(`${BASE_URL}/audit/plan`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionId, ...data }),
+  });
+  const json = await res.json();
+  if (!json.success) throw new Error(json.error);
+  return { plan: json.plan, message: json.message };
+}
+
+// 阶段一·确认：保存用户勾选/编辑后的审核清单
+export async function confirmAuditPlan(
+  sessionId: string,
+  plan: AuditPlan
+): Promise<{ plan: AuditPlan; enabledCount: number }> {
+  const res = await fetch(`${BASE_URL}/audit/plan/confirm`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionId, plan }),
+  });
+  const json = await res.json();
+  if (!json.success) throw new Error(json.error);
+  return { plan: json.plan, enabledCount: json.enabledCount };
+}
+
+// 阶段二：依据确认后的清单执行 LLM 全方位审查
+export async function runLlmAudit(sessionId: string): Promise<MultiDimReviewResult> {
+  const res = await fetch(`${BASE_URL}/audit/run`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionId }),
+  });
+  const json = await res.json();
+  if (!json.success) throw new Error(json.error);
+  return json.result;
 }

@@ -1,4 +1,4 @@
-// Word 文件解析模块
+// 文档解析模块（Word + PDF）
 import mammoth from "mammoth";
 import type { Section, UploadedFile } from "../types.js";
 import { randomUUID } from "crypto";
@@ -12,6 +12,31 @@ import { tmpdir } from "os";
  */
 function isDocFile(fileName: string): boolean {
   return fileName.toLowerCase().endsWith(".doc") && !fileName.toLowerCase().endsWith(".docx");
+}
+
+/**
+ * 判断是否为 .pdf 文件
+ */
+function isPdfFile(fileName: string): boolean {
+  return fileName.toLowerCase().endsWith(".pdf");
+}
+
+/**
+ * 解析 PDF 文件，提取纯文本
+ * 使用 pdf-parse 库，从 Buffer 直接读取
+ *
+ * 注意：pdf-parse 1.1.1 的 index.js 中有 isDebugMode = !module.parent 的逻辑，
+ * 在 ESM import() 下 module.parent 为 undefined，会触发尝试加载
+ * ./test/data/05-versions-space.pdf（通常不存在）并报错。
+ * 因此直接从 lib/pdf-parse.js 加载，绕过 index.js 的测试文件逻辑。
+ */
+async function parsePdf(buffer: Buffer, fileName: string): Promise<{ text: string }> {
+  // 直接加载 lib 实现，避免触发 index.js 的 isDebugMode 加载测试文件
+  const createRequire = (await import("module")).createRequire;
+  const require = createRequire(import.meta.url);
+  const pdfParse = require("pdf-parse/lib/pdf-parse.js");
+  const data = await pdfParse(buffer, { max: 0 });
+  return { text: (data && data.text) || "" };
 }
 
 /**
@@ -58,23 +83,32 @@ async function convertDocToDocx(docBuffer: Buffer): Promise<Buffer> {
 }
 
 /**
- * 解析 Word 文件（.doc 或 .docx），提取纯文本并按章节结构化
- * .doc 文件会自动通过 Microsoft Word COM 转换为 .docx 后再解析
+ * 解析文档文件（.pdf / .doc / .docx），提取纯文本并按章节结构化
+ * - .pdf：直接由 pdf-parse 提取文本层
+ * - .doc：通过 Microsoft Word COM 转换为 .docx 后再解析
+ * - .docx：mammoth 直接提取
  */
 export async function parseDocx(buffer: Buffer, fileName: string): Promise<UploadedFile> {
   let parseBuffer = buffer;
   let displayName = fileName;
+  let rawText = "";
 
-  // .doc 文件先转换为 .docx
-  if (isDocFile(fileName)) {
-    parseBuffer = await convertDocToDocx(buffer);
-    // 将显示名改为 .docx 扩展名，避免后续逻辑误判
-    displayName = fileName.replace(/\.doc$/i, ".docx");
+  // PDF 分支
+  if (isPdfFile(fileName)) {
+    const pdfResult = await parsePdf(buffer, fileName);
+    rawText = pdfResult.text;
+  } else {
+    // .doc 文件先转换为 .docx
+    if (isDocFile(fileName)) {
+      parseBuffer = await convertDocToDocx(buffer);
+      // 将显示名改为 .docx 扩展名，避免后续逻辑误判
+      displayName = fileName.replace(/\.doc$/i, ".docx");
+    }
+
+    // 使用 mammoth 提取纯文本
+    const result = await mammoth.extractRawText({ buffer: parseBuffer });
+    rawText = result.value;
   }
-
-  // 使用 mammoth 提取纯文本
-  const result = await mammoth.extractRawText({ buffer: parseBuffer });
-  const rawText = result.value;
 
   // 按章节结构化
   const sections = structureByHeadings(rawText);

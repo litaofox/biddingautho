@@ -122,3 +122,117 @@ export interface BidderForm {
   technical: File | null;
   commercial: File | null;
 }
+
+// ========== 多维审核模块类型（F1-F10） ==========
+
+/** 问题位置定位（F9） */
+export interface IssueLocation {
+  file: string;
+  chapter?: string;
+  page?: number;
+  tableId?: string;
+  tableRow?: number;
+  snippet?: string;
+}
+
+/** 问题风险等级 */
+export type RiskLevel = "critical" | "major" | "minor" | "info" | "highlight";
+
+/** 审核维度 */
+export type IssueDimension =
+  | "qualification"
+  | "substantive"
+  | "consistency"
+  | "structure"
+  | "template"
+  | "signature"
+  | "textFlaw"
+  | "highlight"
+  | "completeness";
+
+/** 审核问题统一结构 */
+export interface Issue {
+  id: string;
+  dimension: IssueDimension;
+  name: string;
+  riskLevel: RiskLevel;
+  location: IssueLocation;
+  description: string;
+  evidence?: string;
+  basis?: string;
+  remediation?: string;
+  priority?: "P0" | "P1" | "P2";
+}
+
+/** 完整性对照项（F8） */
+export interface CompletenessItem {
+  formatId: string;
+  formatName: string;
+  fileName: string;
+  status: "complete" | "partial" | "missing";
+  remark?: string;
+}
+
+/** 整改清单 */
+export interface RemediationPlan {
+  p0: Issue[];
+  p1: Issue[];
+  p2: Issue[];
+  manualCheck: string[];
+}
+
+/** 多维审核结果 */
+export interface MultiDimReviewResult {
+  mode: ReviewMode;
+  bidders: string[];
+  issues: Issue[];
+  completeness: CompletenessItem[];
+  highlights: Issue[];
+  remediationPlan: RemediationPlan;
+  summary: {
+    criticalCount: number;
+    majorCount: number;
+    minorCount: number;
+    highlightCount: number;
+    overallRisk: "high" | "medium" | "low";
+    conclusion: string;
+  };
+}
+
+/** 多维审核配置 */
+export interface MultiDimConfig {
+  enabledDimensions?: IssueDimension[];
+  mode?: ReviewMode;
+}
+
+// ========== LLM 动态审核清单（两阶段） ==========
+
+/** 项目元信息 */
+export interface ProjectMeta {
+  projectName: string;
+  projectCode?: string;
+  purchaser?: string;
+  agency?: string;
+  evalMethod?: string;
+  budget?: string;
+  bidDeadline?: string;
+  starClauses?: string[];
+}
+
+/** 审核要点 */
+export interface AuditCheckpoint {
+  id: string;
+  dimension: IssueDimension;
+  name: string;
+  requirement: string;
+  basis?: string;
+  riskLevel: "critical" | "major" | "minor";
+  enabled: boolean;
+}
+
+/** LLM 动态审核清单 */
+export interface AuditPlan {
+  meta: ProjectMeta;
+  checkpoints: AuditCheckpoint[];
+  generatedAt: number;
+}

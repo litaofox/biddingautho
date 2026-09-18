@@ -1,6 +1,10 @@
 // LLM 增强模块 - 统一适配层
 // 支持 OpenAI / 百度千帆 / 智谱 GLM / 通义千问 / 本地兼容模型
-import type { ReviewConfig, ReviewItem, RejectionItem, ScoringItem } from "../types.js";
+import type {
+  ReviewConfig, ReviewItem, RejectionItem, ScoringItem,
+  AuditPlan, AuditCheckpoint, Issue, IssueDimension, RiskLevel,
+  CompletenessItem,
+} from "../types.js";
 import {
   EXTRACT_REVIEW_DIMENSIONS_PROMPT,
   RETRIEVE_EVIDENCE_PROMPT,
@@ -9,6 +13,11 @@ import {
   JUDGE_SCORING_PROMPT,
   EVALUATE_PROMPT,
 } from "../llmEngine/prompts.js";
+import {
+  GENERATE_AUDIT_PLAN_PROMPT,
+  AUDIT_BATCH_PROMPT,
+  AUDIT_COMPLETENESS_PROMPT,
+} from "../llmEngine/auditPrompts.js";
 
 /**
  * 文本脱敏：在发送到外部 LLM 前替换敏感身份信息
@@ -766,6 +775,161 @@ export class LLMAugmenter {
     }
   }
 
+  // ========== 全方位审核（九大维度，两阶段） ==========
+
+  /**
+   * 阶段一：根据采购文件 + 项目需求生成动态审核清单
+   * 返回 null 表示 LLM 未返回可解析结果
+   */
+  async generateAuditPlan(
+    procurementText: string,
+    projectReqText?: string
+  ): Promise<AuditPlan | null> {
+    const combined = (procurementText || "") + "\n" + (projectReqText || "");
+    if (!combined.trim()) return null;
+
+    const content = await this.callLLM(
+      GENERATE_AUDIT_PLAN_PROMPT,
+      combined.slice(0, 30000)
+    );
+    if (!content) return null;
+
+    try {
+      const parsed = this.parseJSON(content);
+      const rawMeta = (parsed && parsed.meta) || {};
+      const meta = {
+        projectName: String(rawMeta.projectName || "未命名项目").slice(0, 120),
+        projectCode: rawMeta.projectCode ? String(rawMeta.projectCode).slice(0, 80) : undefined,
+        purchaser: rawMeta.purchaser ? String(rawMeta.purchaser).slice(0, 80) : undefined,
+        agency: rawMeta.agency ? String(rawMeta.agency).slice(0, 80) : undefined,
+        evalMethod: rawMeta.evalMethod ? String(rawMeta.evalMethod).slice(0, 80) : undefined,
+        budget: rawMeta.budget ? String(rawMeta.budget).slice(0, 120) : undefined,
+        bidDeadline: rawMeta.bidDeadline ? String(rawMeta.bidDeadline).slice(0, 80) : undefined,
+        starClauses: Array.isArray(rawMeta.starClauses)
+          ? rawMeta.starClauses.map((s: unknown) => String(s)).filter(Boolean).slice(0, 15)
+          : [],
+      };
+
+      const rawList: any[] = Array.isArray(parsed.checkpoints) ? parsed.checkpoints : [];
+      const ts = Date.now();
+      const checkpoints: AuditCheckpoint[] = rawList
+        .filter((c) => c && c.name && c.requirement && AUDIT_DIMENSIONS.has(c.dimension))
+        .slice(0, 60)
+        .map((c, idx) => ({
+          id: `cp_${idx}_${ts}`,
+          dimension: c.dimension as IssueDimension,
+          name: String(c.name).slice(0, 60),
+          requirement: String(c.requirement).slice(0, 400),
+          basis: c.basis ? String(c.basis).slice(0, 200) : undefined,
+          riskLevel: ["critical", "major", "minor"].includes(c.riskLevel)
+            ? (c.riskLevel as "critical" | "major" | "minor")
+            : "minor",
+          enabled: true,
+        }));
+
+      if (checkpoints.length === 0) return null;
+      return { meta, checkpoints, generatedAt: ts };
+    } catch (err) {
+      console.warn("[LLM] generateAuditPlan: JSON parse failed", err instanceof Error ? err.message : err);
+      return null;
+    }
+  }
+
+  /**
+   * 阶段二：对单个维度的一组审核要点做证据检索 + 判定，返回该维度 Issue[]
+   * @param dimension 当前维度（强制覆盖 LLM 返回的 dimension，防止跑偏）
+   * @param checkpoints 该维度下启用的审核要点
+   * @param bidText 该投标人商务+技术合并全文
+   */
+  async auditDimensionBatch(
+    dimension: IssueDimension,
+    checkpoints: AuditCheckpoint[],
+    bidText: string
+  ): Promise<Issue[]> {
+    if (checkpoints.length === 0 || !bidText.trim()) return [];
+
+    // 1. 证据检索（复用私有方法：本地预筛选 + 小批量 LLM 检索）
+    const evidenceMap = await this.retrieveEvidenceBatch(
+      checkpoints.map((cp) => ({
+        name: cp.name,
+        desc: `${cp.requirement}${cp.basis ? `（依据：${cp.basis}）` : ""}`,
+        keywords: extractAuditKeywords(cp.name, cp.requirement, dimension),
+      })),
+      bidText
+    );
+
+    // 2. 聚合要点 + 证据
+    let anyEvidence = false;
+    const brief = checkpoints
+      .map((cp, i) => `${i + 1}. [${cp.riskLevel}] ${cp.name}\n   判定标准：${cp.requirement}${cp.basis ? `\n   依据：${cp.basis}` : ""}`)
+      .join("\n");
+
+    const evidenceParts = checkpoints.map((cp) => {
+      const ev = evidenceMap[cp.name] || [];
+      if (ev.length > 0) anyEvidence = true;
+      const text = ev.length > 0 ? ev.map((e) => "· " + e).join("\n") : "（未检索到直接证据）";
+      return `【要点】${cp.name}\n${text.slice(0, 1500)}`;
+    });
+
+    let evidenceText = evidenceParts.join("\n\n").slice(0, 16000);
+    if (!anyEvidence) {
+      evidenceText += `\n\n【兜底材料：投标文件前 12000 字符】\n${bidText.slice(0, 12000)}`;
+    }
+
+    const userMsg =
+      `本批审核维度：${dimension}\n\n` +
+      `招标审核要点：\n${brief}\n\n` +
+      `投标文件证据片段：\n${evidenceText}`;
+
+    const content = await this.callLLM(AUDIT_BATCH_PROMPT, userMsg);
+    if (!content) return [];
+
+    try {
+      const arr = this.parseJSON(content);
+      if (!Array.isArray(arr)) return [];
+      const ts = Date.now();
+      return arr
+        .filter((x: any) => x && (x.name || x.description))
+        .slice(0, 40)
+        .map((x: any, idx: number) => normalizeIssue(x, dimension, idx, ts));
+    } catch (err) {
+      console.warn(`[LLM] auditDimensionBatch[${dimension}] parse failed`, err instanceof Error ? err.message : err);
+      return [];
+    }
+  }
+
+  /**
+   * 补充：投标文件格式完整性对照 + 待人工核验清单
+   */
+  async auditCompleteness(
+    bidText: string
+  ): Promise<{ completeness: CompletenessItem[]; manualCheck: string[] }> {
+    if (!bidText.trim()) return { completeness: [], manualCheck: [] };
+    const content = await this.callLLM(AUDIT_COMPLETENESS_PROMPT, bidText.slice(0, 20000));
+    if (!content) return { completeness: [], manualCheck: [] };
+    try {
+      const parsed = this.parseJSON(content);
+      const rawList: any[] = Array.isArray(parsed.completeness) ? parsed.completeness : [];
+      const completeness: CompletenessItem[] = rawList
+        .filter((c) => c && c.formatName)
+        .slice(0, 20)
+        .map((c) => ({
+          formatId: String(c.formatId || "").slice(0, 10),
+          formatName: String(c.formatName).slice(0, 60),
+          fileName: c.fileName ? String(c.fileName).slice(0, 120) : "",
+          status: ["complete", "partial", "missing"].includes(c.status) ? c.status : "partial",
+          remark: c.remark ? String(c.remark).slice(0, 200) : undefined,
+        }));
+      const manualCheck: string[] = Array.isArray(parsed.manualCheck)
+        ? parsed.manualCheck.map((s: unknown) => String(s)).filter(Boolean).slice(0, 15)
+        : [];
+      return { completeness, manualCheck };
+    } catch (err) {
+      console.warn("[LLM] auditCompleteness parse failed", err instanceof Error ? err.message : err);
+      return { completeness: [], manualCheck: [] };
+    }
+  }
+
   /**
    * 从 LLM 返回内容中解析 JSON（兼容 markdown 代码块包裹）
    */
@@ -804,5 +968,73 @@ export function buildLLMConfig(config: ReviewConfig): LLMConfig | null {
     provider: config.llm.provider as LLMConfig["provider"],
     apiKey: config.llm.apiKey,
     scope: config.llm.scope,
+  };
+}
+
+// ========== 全方位审核辅助常量与函数 ==========
+
+const AUDIT_DIMENSIONS = new Set<IssueDimension>([
+  "qualification", "substantive", "consistency", "structure", "template",
+  "signature", "textFlaw", "highlight", "completeness",
+]);
+
+const VALID_RISK_LEVELS: RiskLevel[] = ["critical", "major", "minor", "info", "highlight"];
+
+/** 各维度的补充检索关键词，提升证据预筛选阶段的召回率 */
+const DIM_KEYWORDS: Record<IssueDimension, string[]> = {
+  qualification: ["营业执照", "资质", "资格", "财务", "税收", "社保", "违法", "信用", "声明", "认证"],
+  substantive: ["★", "●", "必须", "无效", "否决", "有效期", "报价", "预算", "承诺", "盖章", "联合体", "备选"],
+  consistency: ["业绩", "金额", "时间", "人员", "证书", "年限", "报价", "合计", "数量", "矛盾", "一致"],
+  structure: ["序号", "列", "页码", "索引", "明细", "合计", "分项", "签字", "日期", "联系", "手机"],
+  template: ["XXX", "xxx", "详见", "模板", "监理", "施工", "咨询", "自行补充", "待填", "占位"],
+  signature: ["●", "签字", "盖章", "公章", "签名", "签章", "授权", "法定代表人"],
+  textFlaw: ["编号", "页脚", "正本", "应答", "对答", "断句", "图", "表"],
+  highlight: ["正偏离", "优于", "分钟", "小时", "全覆盖", "社保", "满分", "增值", "演练", "承诺"],
+  completeness: ["投标书", "授权委托书", "开标一览表", "报价明细表", "资格证明", "声明", "人员安排", "负责人", "业绩", "服务方案", "服务承诺", "基本情况", "索引"],
+};
+
+/** 从要点名称+要求中提取证据预筛关键词（中文按停顿切短语，叠加维度词典） */
+function extractAuditKeywords(name: string, requirement: string, dimension: IssueDimension): string[] {
+  const raw = `${name} ${requirement} ${(DIM_KEYWORDS[dimension] || []).join(" ")}`;
+  const parts = raw
+    .split(/[，。；：、,.;:（）()\[\]【】\s/／|""''""'']+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length >= 2 && s.length <= 16);
+  const set = new Set<string>();
+  parts.forEach((p) => set.add(p));
+  (DIM_KEYWORDS[dimension] || []).forEach((k) => set.add(k));
+  return Array.from(set).slice(0, 24);
+}
+
+function toPositiveIntOrUndefined(v: unknown): number | undefined {
+  if (v === null || v === undefined || v === "") return undefined;
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+}
+
+/** 将 LLM 返回的单个问题规范化为 Issue（强制对齐维度，补齐 id/位置） */
+function normalizeIssue(x: any, dimension: IssueDimension, idx: number, ts: number): Issue {
+  let riskLevel: RiskLevel = VALID_RISK_LEVELS.includes(x.riskLevel) ? (x.riskLevel as RiskLevel) : "minor";
+  // 亮点维度的产出一律标记为 highlight
+  if (dimension === "highlight") riskLevel = "highlight";
+
+  const loc = x.location || {};
+  return {
+    id: `llm_issue_${dimension}_${idx}_${ts}`,
+    dimension,
+    name: String(x.name || "未命名问题").slice(0, 80),
+    riskLevel,
+    location: {
+      file: loc.file ? String(loc.file).slice(0, 60) : "投标文件",
+      chapter: loc.chapter ? String(loc.chapter).slice(0, 80) : undefined,
+      page: toPositiveIntOrUndefined(loc.page),
+      tableId: loc.tableId ? String(loc.tableId).slice(0, 30) : undefined,
+      tableRow: toPositiveIntOrUndefined(loc.tableRow),
+      snippet: loc.snippet ? String(loc.snippet).slice(0, 80) : undefined,
+    },
+    description: String(x.description || "").slice(0, 600),
+    evidence: x.evidence ? String(x.evidence).slice(0, 400) : undefined,
+    basis: x.basis ? String(x.basis).slice(0, 200) : undefined,
+    remediation: x.remediation ? String(x.remediation).slice(0, 300) : undefined,
   };
 }

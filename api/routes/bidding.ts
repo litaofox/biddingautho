@@ -15,15 +15,15 @@ const router = Router();
 // 内存存储上传文件（multer memoryStorage）
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
+  limits: { fileSize: 100 * 1024 * 1024 }, // 100MB
 });
 
 /**
- * 检查文件是否为支持的 Word 格式（.doc 或 .docx）
+ * 检查文件是否为支持的格式（.pdf / .doc / .docx）
  */
 function isSupportedDoc(fileName: string): boolean {
   const lower = fileName.toLowerCase();
-  return lower.endsWith(".docx") || lower.endsWith(".doc");
+  return lower.endsWith(".pdf") || lower.endsWith(".docx") || lower.endsWith(".doc");
 }
 
 /**
@@ -58,7 +58,7 @@ router.post("/upload", (req: Request, res: Response) => {
     if (multerErr) {
       console.error("[upload] multer error:", multerErr);
       if ((multerErr as { code?: string }).code === "LIMIT_FILE_SIZE") {
-        return res.status(400).json({ success: false, error: "文件大小超过 50MB 限制" });
+        return res.status(400).json({ success: false, error: "文件大小超过 100MB 限制" });
       }
       return res.status(400).json({ success: false, error: "文件上传失败: " + (multerErr as Error).message });
     }
@@ -84,7 +84,7 @@ async function handleUpload(req: Request, res: Response) {
 
     // 检查采购文件格式
     if (!isSupportedDoc(procurementName)) {
-      return res.status(400).json({ success: false, error: "采购文件仅支持 .doc 或 .docx 格式" });
+      return res.status(400).json({ success: false, error: "采购文件仅支持 .pdf、.doc 或 .docx 格式" });
     }
 
     // 检查项目需求文件格式
@@ -92,7 +92,7 @@ async function handleUpload(req: Request, res: Response) {
     if (files.projectReq && files.projectReq.length > 0) {
       projectReqName = decodeFilename(files.projectReq[0].originalname);
       if (!isSupportedDoc(projectReqName)) {
-        return res.status(400).json({ success: false, error: "项目需求文件仅支持 .doc 或 .docx 格式" });
+        return res.status(400).json({ success: false, error: "项目需求文件仅支持 .pdf、.doc 或 .docx 格式" });
       }
     }
 
@@ -101,7 +101,7 @@ async function handleUpload(req: Request, res: Response) {
     for (const f of bidderFiles) {
       const fn = decodeFilename(f.originalname);
       if (!isSupportedDoc(fn)) {
-        return res.status(400).json({ success: false, error: `投标文件 ${fn} 仅支持 .doc 或 .docx 格式` });
+        return res.status(400).json({ success: false, error: `投标文件 ${fn} 仅支持 .pdf、.doc 或 .docx 格式` });
       }
     }
 

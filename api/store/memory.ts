@@ -4,11 +4,12 @@ import type { Task } from "../types.js";
 const store = new Map<string, Task>();
 const SESSION_TTL = 30 * 60 * 1000; // 30 分钟
 
-// 定时清理过期会话
+// 定时清理过期会话（基于最后访问时间，活跃会话自动续期）
 setInterval(() => {
   const now = Date.now();
   for (const [id, task] of store) {
-    if (now - task.createdAt > SESSION_TTL) {
+    const last = task.lastAccessedAt ?? task.createdAt;
+    if (now - last > SESSION_TTL) {
       store.delete(id);
       console.log(`[store] session ${id} expired and removed`);
     }
@@ -21,19 +22,25 @@ export function createTask(sessionId: string): Task {
     procurement: null as any,
     bidders: [],
     createdAt: Date.now(),
+    lastAccessedAt: Date.now(),
   };
   store.set(sessionId, task);
   return task;
 }
 
 export function getTask(sessionId: string): Task | undefined {
-  return store.get(sessionId);
+  const task = store.get(sessionId);
+  if (task) {
+    task.lastAccessedAt = Date.now(); // 活跃访问续期
+  }
+  return task;
 }
 
 export function updateTask(sessionId: string, patch: Partial<Task>): Task | undefined {
   const task = store.get(sessionId);
   if (!task) return undefined;
   Object.assign(task, patch);
+  task.lastAccessedAt = Date.now(); // 活跃写入续期
   return task;
 }
 

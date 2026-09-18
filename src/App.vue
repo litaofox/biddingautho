@@ -4,6 +4,7 @@ import { ShieldCheck } from "lucide-vue-next";
 import UploadPage from "@/pages/UploadPage.vue";
 import ConfigPage from "@/pages/ConfigPage.vue";
 import ResultPage from "@/pages/ResultPage.vue";
+import RemediationPage from "@/pages/RemediationPage.vue";
 import ExportPage from "@/pages/ExportPage.vue";
 import type { UnifiedReviewResult, ReviewMode } from "@/types";
 
@@ -16,6 +17,7 @@ const steps = [
   { name: "文件上传", color: "cyan" },
   { name: "审查配置", color: "magenta" },
   { name: "审查结果", color: "green" },
+  { name: "多维审核", color: "magenta" },
   { name: "报告导出", color: "cyan" },
 ];
 
@@ -39,6 +41,15 @@ function onReviewed(result: UnifiedReviewResult) {
   reviewResult.value = result;
   reviewMode.value = result.mode;
   nextStep();
+}
+// LLM 模式两阶段审查完成：结果已是 MultiDimReviewResult，直接进入多维审核页（跳过符合性结果页）
+function onLlmAudited() {
+  reviewMode.value = "llm";
+  currentStep.value = 3;
+}
+// 多维审核页返回：LLM 模式回到审查配置（无符合性结果页），本地模式回到符合性结果页
+function onRemediationBack() {
+  currentStep.value = reviewMode.value === "llm" ? 1 : 2;
 }
 
 const colorMap: Record<string, string> = {
@@ -108,6 +119,7 @@ const colorMap: Record<string, string> = {
           v-else-if="currentStep === 1"
           :session-id="sessionId"
           @reviewed="onReviewed"
+          @llm-audited="onLlmAudited"
           @back="prevStep"
         />
         <ResultPage
@@ -116,10 +128,17 @@ const colorMap: Record<string, string> = {
           @next="nextStep"
           @back="prevStep"
         />
+        <RemediationPage
+          v-else-if="currentStep === 3"
+          :session-id="sessionId"
+          @next="nextStep"
+          @back="onRemediationBack"
+        />
         <ExportPage
           v-else
           :session-id="sessionId"
           :result="reviewResult"
+          :mode="reviewMode"
           @back="prevStep"
           @restart="restart"
         />

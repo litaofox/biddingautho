@@ -2,13 +2,17 @@
 import { ref, computed, onMounted } from "vue";
 import {
   Settings, Bot, ShieldAlert, ChevronDown, ChevronUp, Sliders, Loader2,
-  Plus, Trash2, Sparkles, RefreshCw, Info, FileSearch, ShieldCheck
+  Plus, Trash2, Sparkles, RefreshCw, Info, FileSearch, ShieldCheck,
+  ClipboardList, Pencil, ListChecks
 } from "lucide-vue-next";
 import {
   runReview, getReviewItems, addCustomReviewItem, deleteCustomReviewItem,
-  regenerateReviewItems, getLLMMode
+  regenerateReviewItems, getLLMMode, generateAuditPlan, confirmAuditPlan, runLlmAudit,
 } from "@/api";
-import type { ReviewItem, ReviewItemSet, UnifiedReviewResult, ReviewMode } from "@/types";
+import type {
+  ReviewItem, ReviewItemSet, UnifiedReviewResult, ReviewMode,
+  AuditPlan, AuditCheckpoint, IssueDimension,
+} from "@/types";
 
 const props = defineProps<{
   sessionId: string;
@@ -16,6 +20,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (e: "reviewed", result: UnifiedReviewResult): void;
+  (e: "llm-audited"): void;
   (e: "back"): void;
 }>();
 
@@ -47,6 +52,77 @@ const showLlmPanel = ref(true);
 const llmReviewProvider = ref("qianwen");
 const llmReviewApiKey = ref("");
 const llmReviewRiskConfirmed = ref(false);
+
+// ========== LLM 两阶段：审核清单生成 → 确认 → 执行 ==========
+// setup = 配置服务商并生成清单；plan = 查看/编辑/勾选清单并执行审查
+const llmStage = ref<"setup" | "plan">("setup");
+const auditPlan = ref<AuditPlan | null>(null);
+const generatingPlan = ref(false);
+const auditing = ref(false);
+const planMessage = ref("");
+const showAddCp = ref(false);
+const newCp = ref<{
+  dimension: IssueDimension;
+  name: string;
+  requirement: string;
+  riskLevel: "critical" | "major" | "minor";
+}>({ dimension: "consistency", name: "", requirement: "", riskLevel: "major" });
+
+// 九大维度展示元数据（顺序对齐审核报告）
+const DIM_META: { key: IssueDimension; label: string; chip: string }[] = [
+  { key: "qualification", label: "资格合规性", chip: "text-blue-700 border-blue-300 bg-blue-50" },
+  { key: "substantive", label: "★实质性条款", chip: "text-red-700 border-red-300 bg-red-50" },
+  { key: "consistency", label: "数据一致性", chip: "text-orange-700 border-orange-300 bg-orange-50" },
+  { key: "structure", label: "结构规范性", chip: "text-amber-700 border-amber-300 bg-amber-50" },
+  { key: "template", label: "模板残留", chip: "text-yellow-700 border-yellow-300 bg-yellow-50" },
+  { key: "signature", label: "签字盖章", chip: "text-rose-700 border-rose-300 bg-rose-50" },
+  { key: "textFlaw", label: "文本瑕疵", chip: "text-slate-700 border-slate-300 bg-slate-50" },
+  { key: "completeness", label: "完整性对照", chip: "text-indigo-700 border-indigo-300 bg-indigo-50" },
+  { key: "highlight", label: "合规亮点", chip: "text-emerald-700 border-emerald-300 bg-emerald-50" },
+];
+
+// 按维度分组的要点
+const checkpointsByDim = computed(() => {
+  const map = new Map<IssueDimension, AuditCheckpoint[]>();
+  if (!auditPlan.value) return map;
+  for (const cp of auditPlan.value.checkpoints) {
+    const arr = map.get(cp.dimension) || [];
+    arr.push(cp);
+    map.set(cp.dimension, arr);
+  }
+  return map;
+});
+
+const enabledCpCount = computed(
+  () => auditPlan.value?.checkpoints.filter((c) => c.enabled).length || 0
+);
+
+function toggleDimAll(key: IssueDimension) {
+  const list = checkpointsByDim.value.get(key) || [];
+  if (list.length === 0) return;
+  const allOn = list.every((c) => c.enabled);
+  list.forEach((c) => (c.enabled = !allOn));
+}
+
+function removeCheckpoint(id: string) {
+  if (!auditPlan.value) return;
+  auditPlan.value.checkpoints = auditPlan.value.checkpoints.filter((c) => c.id !== id);
+}
+
+function addCheckpoint() {
+  if (!auditPlan.value) return;
+  if (!newCp.value.name.trim() || !newCp.value.requirement.trim()) return;
+  auditPlan.value.checkpoints.push({
+    id: `custom_cp_${Date.now()}`,
+    dimension: newCp.value.dimension,
+    name: newCp.value.name.trim(),
+    requirement: newCp.value.requirement.trim(),
+    riskLevel: newCp.value.riskLevel,
+    enabled: true,
+  });
+  newCp.value.name = "";
+  newCp.value.requirement = "";
+}
 
 // ========== 通用状态 ==========
 const reviewing = ref(false);
@@ -300,6 +376,64 @@ async function handleReview() {
   }
 }
 
+// ========== LLM 两阶段流程 ==========
+
+// 切换审核模式（切回本地时重置 LLM 阶段）
+function selectMode(mode: ReviewMode) {
+  reviewMode.value = mode;
+  if (mode === "local") llmStage.value = "setup";
+}
+
+// 阶段一：调用 LLM 根据采购文件+需求生成审核清单
+async function handleGeneratePlan() {
+  if (!llmCanProceed.value) return;
+  generatingPlan.value = true;
+  errorMsg.value = "";
+  planMessage.value = "";
+  try {
+    const { plan, message } = await generateAuditPlan(props.sessionId, {
+      provider: llmReviewProvider.value,
+      apiKey: llmReviewApiKey.value.trim(),
+    });
+    auditPlan.value = plan;
+    planMessage.value = message;
+    llmStage.value = "plan";
+  } catch (err) {
+    errorMsg.value = err instanceof Error ? err.message : "审核清单生成失败";
+  } finally {
+    generatingPlan.value = false;
+  }
+}
+
+// 阶段二：先确认（持久化勾选/编辑），再执行 LLM 审查
+async function handleConfirmAndAudit() {
+  if (!auditPlan.value) return;
+  if (enabledCpCount.value === 0) {
+    errorMsg.value = "请至少勾选一个审查要点";
+    return;
+  }
+  auditing.value = true;
+  errorMsg.value = "";
+  try {
+    await confirmAuditPlan(props.sessionId, auditPlan.value);
+    await runLlmAudit(props.sessionId);
+    emit("llm-audited");
+  } catch (err) {
+    errorMsg.value = err instanceof Error ? err.message : "AI 审查失败";
+  } finally {
+    auditing.value = false;
+  }
+}
+
+// 返回：清单页先回到模型配置，配置页再回到上传
+function handleBack() {
+  if (reviewMode.value === "llm" && llmStage.value === "plan") {
+    llmStage.value = "setup";
+    return;
+  }
+  emit("back");
+}
+
 onMounted(() => {
   loadReviewItems();
 });
@@ -327,7 +461,7 @@ onMounted(() => {
       <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
         <!-- 本地审核 -->
         <button
-          @click="reviewMode = 'local'"
+          @click="selectMode('local')"
           class="text-left p-5 rounded-xl border-2 transition-all"
           :class="reviewMode === 'local'
             ? 'border-blue-500 bg-blue-50 shadow-md'
@@ -359,7 +493,7 @@ onMounted(() => {
 
         <!-- LLM 审核 -->
         <button
-          @click="reviewMode = 'llm'"
+          @click="selectMode('llm')"
           class="text-left p-5 rounded-xl border-2 transition-all"
           :class="reviewMode === 'llm'
             ? 'border-purple-500 bg-purple-50 shadow-md'
@@ -816,8 +950,8 @@ onMounted(() => {
 
     <!-- ========== LLM 审核模式配置 ========== -->
     <template v-else>
-      <!-- LLM 审核配置 -->
-      <div class="cyber-panel p-6 space-y-5">
+      <!-- LLM 审核配置（阶段一：模型配置 + 生成清单） -->
+      <div v-if="llmStage === 'setup'" class="cyber-panel p-6 space-y-5">
         <div class="flex items-center gap-2">
           <Bot class="w-5 h-5 text-purple-600" />
           <h3 class="font-semibold text-slate-700">LLM 智能审核配置</h3>
@@ -918,6 +1052,157 @@ onMounted(() => {
           </div>
         </div>
       </div>
+
+      <!-- ===== 阶段二：审核清单确认（生成于采购文件，可勾选/编辑/增删） ===== -->
+      <div v-if="llmStage === 'plan' && auditPlan" class="cyber-panel p-6 space-y-5">
+        <div class="flex items-center gap-2">
+          <ClipboardList class="w-5 h-5 text-purple-600" />
+          <h3 class="font-semibold text-slate-700">确认审核清单</h3>
+          <span class="ml-auto text-xs px-2 py-0.5 rounded bg-purple-100 text-purple-700 border border-purple-300">
+            已启用 {{ enabledCpCount }} / {{ auditPlan.checkpoints.length }} 项
+          </span>
+        </div>
+
+        <div class="p-3 rounded-lg bg-purple-50 border border-purple-200 flex items-start gap-2">
+          <Info class="w-4 h-4 text-purple-600 flex-shrink-0 mt-0.5" />
+          <p class="text-xs text-purple-800">
+            以下审核要点由大模型依据<b>本项目采购文件与需求</b>动态生成。请勾选实际要审查的要点，可直接修改判定标准、调整风险等级、删除或新增；确认后大模型将逐项对投标文件进行审查并生成报告。
+          </p>
+        </div>
+
+        <!-- 项目元信息 -->
+        <div class="rounded-lg border border-slate-200 p-4 bg-slate-50/60">
+          <div class="flex items-center gap-2 mb-3">
+            <ListChecks class="w-4 h-4 text-slate-600" />
+            <span class="text-sm font-semibold text-slate-700">项目信息（取自采购文件）</span>
+          </div>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-1.5 text-xs text-slate-600">
+            <p><span class="text-slate-400">项目名称：</span>{{ auditPlan.meta.projectName || "—" }}</p>
+            <p><span class="text-slate-400">项目编号：</span>{{ auditPlan.meta.projectCode || "—" }}</p>
+            <p><span class="text-slate-400">采购人：</span>{{ auditPlan.meta.purchaser || "—" }}</p>
+            <p><span class="text-slate-400">代理机构：</span>{{ auditPlan.meta.agency || "—" }}</p>
+            <p><span class="text-slate-400">评标方法：</span>{{ auditPlan.meta.evalMethod || "—" }}</p>
+            <p><span class="text-slate-400">预算/最高限价：</span>{{ auditPlan.meta.budget || "—" }}</p>
+            <p class="md:col-span-2"><span class="text-slate-400">投标截止/开标：</span>{{ auditPlan.meta.bidDeadline || "—" }}</p>
+          </div>
+          <div v-if="auditPlan.meta.starClauses && auditPlan.meta.starClauses.length" class="mt-3">
+            <p class="text-xs font-semibold text-red-600 mb-1">★ 实质性 / 否决性关键条款</p>
+            <ul class="list-disc pl-5 text-xs text-slate-600 space-y-0.5">
+              <li v-for="(s, i) in auditPlan.meta.starClauses" :key="i">{{ s }}</li>
+            </ul>
+          </div>
+        </div>
+
+        <!-- 按九大维度分组 -->
+        <div v-for="dim in DIM_META" :key="dim.key">
+          <details
+            v-if="checkpointsByDim.get(dim.key) && checkpointsByDim.get(dim.key)!.length"
+            open
+            class="rounded-lg border border-slate-200 overflow-hidden"
+          >
+            <summary class="flex items-center gap-2 cursor-pointer px-4 py-2.5 bg-white select-none">
+              <span class="text-xs px-2 py-0.5 rounded border" :class="dim.chip">{{ dim.label }}</span>
+              <span class="text-xs text-slate-400">{{ checkpointsByDim.get(dim.key)!.length }} 项</span>
+            </summary>
+            <div class="px-4 pb-3 pt-1 space-y-2 bg-slate-50/40">
+              <button
+                type="button"
+                @click="toggleDimAll(dim.key)"
+                class="text-xs text-purple-600 hover:underline"
+              >全选/反选本组</button>
+
+              <div
+                v-for="cp in checkpointsByDim.get(dim.key)"
+                :key="cp.id"
+                class="p-3 rounded-lg border bg-white"
+                :class="cp.enabled ? 'border-purple-200' : 'border-slate-200 opacity-60'"
+              >
+                <div class="flex items-start gap-3">
+                  <input type="checkbox" v-model="cp.enabled" class="w-4 h-4 mt-1 accent-purple-600" />
+                  <div class="flex-1 space-y-2">
+                    <div class="flex items-center gap-2 flex-wrap">
+                      <Pencil class="w-3.5 h-3.5 text-slate-400" />
+                      <input
+                        v-model="cp.name"
+                        class="text-sm font-medium text-slate-700 bg-transparent border-b border-dashed border-slate-200 focus:border-purple-400 outline-none flex-1 min-w-0"
+                      />
+                      <select
+                        v-model="cp.riskLevel"
+                        class="text-xs rounded border border-slate-200 px-1.5 py-0.5"
+                      >
+                        <option value="critical">高危/废标</option>
+                        <option value="major">扣分项</option>
+                        <option value="minor">细节优化</option>
+                      </select>
+                      <button
+                        type="button"
+                        @click="removeCheckpoint(cp.id)"
+                        class="text-slate-300 hover:text-red-500"
+                        title="删除该要点"
+                      ><Trash2 class="w-4 h-4" /></button>
+                    </div>
+                    <textarea
+                      v-model="cp.requirement"
+                      rows="2"
+                      placeholder="判定标准 / 核查要求"
+                      class="w-full text-xs text-slate-600 border border-slate-200 rounded px-2 py-1 focus:border-purple-400 outline-none resize-y"
+                    ></textarea>
+                    <input
+                      v-model="cp.basis"
+                      placeholder="招标依据条款（如：须知23.1 / 评分细则·人员配备12分）"
+                      class="w-full text-xs text-slate-500 border border-slate-200 rounded px-2 py-1 focus:border-purple-400 outline-none"
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
+          </details>
+        </div>
+
+        <!-- 新增自定义要点 -->
+        <div class="rounded-lg border border-dashed border-emerald-300">
+          <button
+            type="button"
+            @click="showAddCp = !showAddCp"
+            class="w-full flex items-center gap-2 px-4 py-2.5 text-sm text-emerald-700"
+          >
+            <Plus class="w-4 h-4" /> 添加自定义审查要点
+          </button>
+          <div v-if="showAddCp" class="px-4 pb-4 space-y-2">
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-2">
+              <select v-model="newCp.dimension" class="text-sm border border-slate-200 rounded px-2 py-1.5">
+                <option v-for="d in DIM_META" :key="d.key" :value="d.key">{{ d.label }}</option>
+              </select>
+              <input
+                v-model="newCp.name"
+                placeholder="要点名称"
+                class="text-sm border border-slate-200 rounded px-2 py-1.5 md:col-span-2"
+              />
+            </div>
+            <textarea
+              v-model="newCp.requirement"
+              rows="2"
+              placeholder="判定标准 / 核查要求"
+              class="w-full text-sm border border-slate-200 rounded px-2 py-1.5"
+            ></textarea>
+            <div class="flex items-center gap-2">
+              <select v-model="newCp.riskLevel" class="text-xs border border-slate-200 rounded px-2 py-1">
+                <option value="critical">高危/废标</option>
+                <option value="major">扣分项</option>
+                <option value="minor">细节优化</option>
+              </select>
+              <button
+                type="button"
+                @click="addCheckpoint"
+                :disabled="!newCp.name.trim() || !newCp.requirement.trim()"
+                class="px-3 py-1 rounded bg-emerald-500 text-white text-xs hover:bg-emerald-600 disabled:opacity-40"
+              >确认添加</button>
+            </div>
+          </div>
+        </div>
+
+        <p v-if="planMessage" class="text-xs text-purple-600">{{ planMessage }}</p>
+      </div>
     </template>
 
     <!-- 错误提示 -->
@@ -927,19 +1212,44 @@ onMounted(() => {
 
     <!-- 底部操作 -->
     <div class="flex justify-between items-center pt-4 border-t border-cyber-border">
-      <button @click="emit('back')" class="cyber-btn text-slate-500 border-slate-200 hover:text-slate-700">
-        ← 上一步
+      <button @click="handleBack" class="cyber-btn text-slate-500 border-slate-200 hover:text-slate-700">
+        ← {{ reviewMode === "llm" && llmStage === "plan" ? "返回模型配置" : "上一步" }}
       </button>
+
+      <!-- 本地模式：直接审查 -->
       <button
+        v-if="reviewMode === 'local'"
         :disabled="!canProceed"
         @click="handleReview"
-        :class="reviewMode === 'llm' ? 'cyber-btn-purple' : 'cyber-btn-magenta'"
-        class="disabled:opacity-40 disabled:cursor-not-allowed"
+        class="cyber-btn-magenta disabled:opacity-40 disabled:cursor-not-allowed"
       >
         <Loader2 v-if="reviewing" class="w-4 h-4 inline animate-spin mr-1" />
         <span v-if="reviewing">审查中...</span>
-        <span v-else-if="reviewMode === 'llm'">开始 AI 审核 →</span>
         <span v-else>开始审查 →</span>
+      </button>
+
+      <!-- LLM 阶段一：生成审核清单 -->
+      <button
+        v-else-if="llmStage === 'setup'"
+        :disabled="!llmCanProceed || generatingPlan"
+        @click="handleGeneratePlan"
+        class="cyber-btn-purple disabled:opacity-40 disabled:cursor-not-allowed"
+      >
+        <Loader2 v-if="generatingPlan" class="w-4 h-4 inline animate-spin mr-1" />
+        <span v-if="generatingPlan">正在读取采购文件、生成清单...</span>
+        <span v-else>① 生成审核清单 →</span>
+      </button>
+
+      <!-- LLM 阶段二：确认清单并执行审查 -->
+      <button
+        v-else
+        :disabled="auditing || enabledCpCount === 0"
+        @click="handleConfirmAndAudit"
+        class="cyber-btn-purple disabled:opacity-40 disabled:cursor-not-allowed"
+      >
+        <Loader2 v-if="auditing" class="w-4 h-4 inline animate-spin mr-1" />
+        <span v-if="auditing">AI 正在逐维度审查，请稍候...</span>
+        <span v-else>② 确认清单并开始 AI 审查（{{ enabledCpCount }} 项）→</span>
       </button>
     </div>
   </div>

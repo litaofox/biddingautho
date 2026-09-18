@@ -116,7 +116,7 @@ async function handleSubmit() {
       <span class="text-cyber-gray text-sm">[步骤 1/4]</span>
     </div>
 
-    <p class="text-cyber-gray text-sm">上传采购文件、项目需求及各投标公司的投标文件（支持 .doc / .docx 格式）</p>
+    <p class="text-cyber-gray text-sm">上传采购文件、项目需求及各投标公司的投标文件（支持 .pdf / .doc / .docx 格式，单文件 ≤ 100MB）</p>
 
     <!-- 三栏上传区 -->
     <div class="grid grid-cols-1 lg:grid-cols-3 gap-5">
@@ -128,7 +128,7 @@ async function handleSubmit() {
           <span class="text-cyber-red text-xs">*必填</span>
         </div>
 
-        <input ref="procurementInput" type="file" accept=".doc,.docx" class="hidden" @change="onProcurementChange" />
+        <input ref="procurementInput" type="file" accept=".pdf,.doc,.docx" class="hidden" @change="onProcurementChange" />
 
         <div
           v-if="!procurementFile"
@@ -137,7 +137,7 @@ async function handleSubmit() {
         >
           <Upload class="w-10 h-10 mx-auto text-cyber-gray group-hover:text-cyber-cyan transition-colors mb-3" />
           <p class="text-sm text-cyber-gray group-hover:text-cyber-cyan transition-colors">点击或拖拽上传</p>
-          <p class="text-xs text-cyber-gray/60 mt-1">.doc / .docx，≤ 50MB</p>
+          <p class="text-xs text-cyber-gray/60 mt-1">.pdf / .doc / .docx，≤ 100MB</p>
         </div>
 
         <div v-else class="flex items-center justify-between p-3 rounded-lg bg-cyber-cyan/10 border border-cyber-cyan/30">
@@ -162,7 +162,7 @@ async function handleSubmit() {
           <span class="text-cyber-gray text-xs">选填</span>
         </div>
 
-        <input ref="projectReqInput" type="file" accept=".doc,.docx,.txt" class="hidden" @change="onProjectReqChange" />
+        <input ref="projectReqInput" type="file" accept=".pdf,.doc,.docx,.txt" class="hidden" @change="onProjectReqChange" />
 
         <div
           v-if="!projectReqFile"
@@ -171,7 +171,7 @@ async function handleSubmit() {
         >
           <Upload class="w-10 h-10 mx-auto text-cyber-gray group-hover:text-cyber-magenta transition-colors mb-3" />
           <p class="text-sm text-cyber-gray group-hover:text-cyber-magenta transition-colors">点击或拖拽上传</p>
-          <p class="text-xs text-cyber-gray/60 mt-1">.doc / .docx 或文本</p>
+          <p class="text-xs text-cyber-gray/60 mt-1">.pdf / .doc / .docx 或文本，≤ 100MB</p>
         </div>
 
         <div v-else class="flex items-center justify-between p-3 rounded-lg bg-cyber-magenta/10 border border-cyber-magenta/30">
@@ -245,7 +245,7 @@ async function handleSubmit() {
             <input
               :ref="(el) => { technicalInputs[bidder.id] = el as HTMLInputElement }"
               type="file"
-              accept=".doc,.docx"
+              accept=".pdf,.doc,.docx"
               class="hidden"
               @change="(e) => onTechnicalChange(e, bidder)"
             />
@@ -280,7 +280,7 @@ async function handleSubmit() {
             <input
               :ref="(el) => { commercialInputs[bidder.id] = el as HTMLInputElement }"
               type="file"
-              accept=".doc,.docx"
+              accept=".pdf,.doc,.docx"
               class="hidden"
               @change="(e) => onCommercialChange(e, bidder)"
             />
