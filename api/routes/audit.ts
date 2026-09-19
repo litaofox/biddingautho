@@ -216,10 +216,11 @@ router.get("/progress/:sessionId", (req: Request, res: Response) => {
  */
 router.post("/auto", async (req: Request, res: Response) => {
   try {
-    const { sessionId, provider, apiKey } = req.body as {
+    const { sessionId, provider, apiKey, simulateScoring } = req.body as {
       sessionId: string;
       provider: string;
       apiKey: string;
+      simulateScoring?: boolean;
     };
     const task = getTask(sessionId);
     if (!task) {
@@ -236,12 +237,15 @@ router.post("/auto", async (req: Request, res: Response) => {
     // 立即响应，后台异步执行
     res.json({ success: true, message: "已开始全自动审核" });
 
+    const doSimulateScoring = simulateScoring !== false; // 默认启用模拟打分
     const steps = [
       { key: "parse", label: "文件解析", status: "done" as const },
       { key: "plan", label: "AI 生成审核清单", status: "active" as const },
       { key: "audit", label: "逐维度合规性检查与内容比对", status: "pending" as const },
       { key: "requirements", label: "采购要求逐条响应比对", status: "pending" as const },
-      { key: "scoring", label: "评分标准解析与逐项打分", status: "pending" as const },
+      ...(doSimulateScoring
+        ? [{ key: "scoring", label: "评分标准解析与逐项打分", status: "pending" as const }]
+        : []),
       { key: "completeness", label: "完整性对照检查", status: "pending" as const },
       { key: "remediation", label: "生成整改清单与审核结论", status: "pending" as const },
       { key: "done", label: "审核完成", status: "pending" as const },
@@ -282,20 +286,25 @@ router.post("/auto", async (req: Request, res: Response) => {
       try {
         const augmenter = createAugmenter(provider, apiKey);
         updateTask(sessionId, {
-          auditLlmConfig: { provider, apiKey: apiKey || "", scope: ["audit"] },
+          auditLlmConfig: {
+            provider,
+            apiKey: apiKey || "",
+            scope: ["audit"],
+            simulateScoring: doSimulateScoring,
+          },
         });
 
-        // 阶段一：生成审核清单（0 ~ 25%）
-        writeProgress(5, "plan", "AI 正在阅读采购文件，梳理审核要点…", "running");
-        const plan = await generateAuditPlan(augmenter, getTask(sessionId)!);
-        plan.checkpoints.forEach((c) => (c.enabled = true)); // 自动确认全部要点
-        updateTask(sessionId, { auditPlan: plan });
-        writeProgress(
-          25,
-          "audit",
-          `已生成 ${plan.checkpoints.length} 个审核要点，开始逐项审查投标文件…`,
-          "running"
-        );
+    // 阶段一：生成审核清单（0 ~ 25%）
+    writeProgress(5, "plan", "AI 正在阅读采购文件，梳理审核要点…", "running");
+    const plan = await generateAuditPlan(augmenter, getTask(sessionId)!);
+    plan.checkpoints.forEach((c) => (c.enabled = true)); // 自动确认全部要点
+    updateTask(sessionId, { auditPlan: plan });
+    writeProgress(
+      25,
+      "audit",
+      `已生成 ${plan.checkpoints.length} 个审核要点，开始逐项审查投标文件…`,
+      "running"
+    );
 
         // 阶段二：逐维度审查（30 ~ 96%，含完整性与整改）
         const latestTask = getTask(sessionId)!;

@@ -76,13 +76,14 @@ function sectionNumbers(
     ["summary", options.summary !== false],
     ["rejection", options.critical !== false && rejectionIssuesOf(result).length > 0],
     ["completeness", options.completeness !== false && (result.completeness || []).length > 0],
-    ["scoring", (result.scoringIndex || []).length > 0 || result.mode === "llm"],
     ["critical", options.critical !== false && nonRejCritical > 0],
     ["major", options.major !== false && majorCnt > 0],
     ["minor", options.minor !== false && minorCnt > 0],
     ["highlights", options.highlights !== false && (result.highlights || []).length > 0],
     ["remediation", options.remediation !== false],
     ["manual", options.manualCheck !== false && (result.remediationPlan?.manualCheck || []).length > 0],
+    // 模拟打分为可选增值内容，统一置于全部审查内容之后（末章）
+    ["scoring", (result.scoringIndex || []).length > 0 || result.mode === "llm"],
   ];
   const out: Partial<Record<SecKey, number>> = {};
   let seq = 0;
@@ -195,13 +196,13 @@ export function generateMultiDimReport(
 ${renderSummary(result, options, sec.summary, rejNo)}
 ${renderRejectionIssues(result, options, sec.rejection)}
 ${renderCompleteness(result, options, sec.completeness)}
-${renderScoringIndex(result, options, sec.scoring)}
 ${renderCriticalIssues(result, options, sec.critical)}
 ${renderMajorIssues(result, options, sec.major)}
 ${renderMinorIssues(result, options, sec.minor)}
 ${renderHighlights(result, options, sec.highlights)}
 ${renderRemediation(result, options, sec.remediation)}
 ${renderManualCheck(result, options, sec.manual)}
+${renderScoringIndex(result, options, sec.scoring)}
 
 <div class="footer">
   审核方法说明：本报告由多维审核引擎自动生成，覆盖资格合规、实质性条款（含采购要求逐条响应比对）、数据一致性、结构规范性、模板残留、签字盖章、文本瑕疵、完整性对照、评分标准逐项打分等维度。生成过程已注入审核基准日期并对模型输出执行系统事实校验（日期断言复核、证据原文溯源），存疑断言一律降级为"待人工核验"，未采信无原文支撑的主观推断。图片类佐证材料（签章、证书、合同、截图）无法通过文本层核验，已列入"待补充核查"。<br>

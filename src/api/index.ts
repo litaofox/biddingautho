@@ -262,7 +262,7 @@ export async function runLlmAudit(sessionId: string): Promise<MultiDimReviewResu
 // 一键 LLM 全自动审核（生成清单→自动确认→逐维度审查），后台异步执行
 export async function startLlmAutoAudit(
   sessionId: string,
-  data: { provider: string; apiKey: string }
+  data: { provider: string; apiKey: string; simulateScoring?: boolean }
 ): Promise<void> {
   const res = await fetch(`${BASE_URL}/audit/auto`, {
     method: "POST",

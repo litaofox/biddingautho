@@ -110,25 +110,31 @@ export async function runLlmAudit(
     : "";
 
   // 从评分办法抽取结构化评分项（审核开始前抽取一次，所有投标人共用）
+  // 用户可在第一步取消勾选"模拟打分"（task.auditLlmConfig.simulateScoring，默认启用）
+  const simulateScoring = task.auditLlmConfig?.simulateScoring !== false;
   let scoringIndex: ScoringIndexEntry[] = [];
-  onProgress?.(30, "scoreplan", "正在解析招标文件评分标准，构建评分索引");
-  if (task.procurement) {
-    try {
-      const { items: scoreItems } = await augmenter.extractScoringItems(
-        task.procurement.text,
-        task.projectRequirements?.text
-      );
-      scoringIndex = scoreItems.map((it) => ({ ...it }));
-      console.log(`[LLM审核] 评分项抽取完成，共 ${scoringIndex.length} 项`);
-      if (scoringIndex.length === 0) {
-        manualChecks.push(
-          "未能自动抽取到结构化评分项，未能进行逐项打分；请人工核查招标文件中的评分办法/评标标准章节（通常位于评标办法章，如“评分标准/评分细则/评审因素及分值”页），按原文分值表逐项评估投标文件"
+  if (simulateScoring) {
+    onProgress?.(30, "scoreplan", "正在解析招标文件评分标准，构建评分索引");
+    if (task.procurement) {
+      try {
+        const { items: scoreItems } = await augmenter.extractScoringItems(
+          task.procurement.text,
+          task.projectRequirements?.text
         );
+        scoringIndex = scoreItems.map((it) => ({ ...it }));
+        console.log(`[LLM审核] 评分项抽取完成，共 ${scoringIndex.length} 项`);
+        if (scoringIndex.length === 0) {
+          manualChecks.push(
+            "未能自动抽取到结构化评分项，未能进行逐项打分；请人工核查招标文件中的评分办法/评标标准章节（通常位于评标办法章，如“评分标准/评分细则/评审因素及分值”页），按原文分值表逐项评估投标文件"
+          );
+        }
+      } catch (err) {
+        console.warn("[LLM审核] 评分项抽取失败（不影响合规审查）", err instanceof Error ? err.message : err);
+        manualChecks.push("评分项自动抽取异常，未能进行逐项打分，请人工核查招标文件评分办法章节后补评");
       }
-    } catch (err) {
-      console.warn("[LLM审核] 评分项抽取失败（不影响合规审查）", err instanceof Error ? err.message : err);
-      manualChecks.push("评分项自动抽取异常，未能进行逐项打分，请人工核查招标文件评分办法章节后补评");
     }
+  } else {
+    console.log("[LLM审核] 用户未启用模拟打分，跳过评分索引与逐项打分");
   }
 
   const totalUnits = task.bidders.length * activeDims.length;

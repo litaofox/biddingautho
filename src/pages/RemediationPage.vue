@@ -50,13 +50,14 @@ const secNo = computed<Record<string, number>>(() => {
   const presence: [string, boolean][] = [
     ["rejection", rejectionIssues.value.length > 0],
     ["completeness", completeness.value.length > 0],
-    ["scoring", scoringIndex.value.length > 0 || isLlmMode.value],
     ["critical", criticalIssues.value.length > 0],
     ["major", majorIssues.value.length > 0],
     ["minor", minorIssues.value.length > 0],
     ["highlights", highlights.value.length > 0],
     ["remediation", !!plan],
     ["manual", !!plan && plan.manualCheck.length > 0],
+    // 模拟打分为可选增值内容，统一置于全部审查内容之后（末章）
+    ["scoring", scoringIndex.value.length > 0 || isLlmMode.value],
   ];
   const map: Record<string, number> = {};
   let seq = 1; // 一、整体核查结论
@@ -399,78 +400,6 @@ onMounted(() => {
         </div>
       </div>
 
-      <!-- 评分索引与逐项打分 -->
-      <div v-if="scoringIndex.length > 0 || isLlmMode" class="bg-white border border-emerald-200 rounded-lg overflow-hidden">
-        <div class="bg-emerald-50 px-4 py-2.5 border-b border-emerald-200 flex items-center justify-between flex-wrap gap-2">
-          <div class="flex items-center gap-2">
-            <FileCheck class="w-4 h-4 text-emerald-700" />
-            <h4 class="font-medium text-emerald-900">{{ secNo.scoring }}、评分索引与逐项打分</h4>
-          </div>
-          <div v-if="scoreTotal" class="text-xs text-emerald-800">
-            模拟评估总分：<b class="text-sm">{{ scoreTotal.got }} / {{ scoreTotal.full }}</b> 分（得分率 {{ scoreTotal.rate }}%）
-          </div>
-        </div>
-        <div v-if="scoringIndex.length === 0" class="px-4 py-4 bg-amber-50 border-l-4 border-amber-400 m-3 rounded">
-          <p class="text-sm font-medium text-amber-900">⚠ 未能自动抽取到结构化评分项，本章未完成逐项打分</p>
-          <p class="mt-1 text-xs text-amber-800 leading-relaxed">
-            系统已尝试定位招标文件中的评标办法/评分标准章节但未解析出可打分的评分项（常见原因：评分办法位于扫描图片页、分值表为复杂表格）。
-            请人工查阅招标文件评分办法章节，按原文分值表逐项对照投标文件评分；该事项已列入待人工核查清单。重新上传文字版招标文件后再次运行审核可自动完成本章。
-          </p>
-        </div>
-        <template v-else>
-        <p class="px-4 pt-2.5 text-xs text-slate-500">
-          严格依据招标文件评分办法原文构建，点击各评分项可展开评分细则、投标文件章节/页码/段落引用、证据原文与详细评分说明；标注"需人工复核"的项不作为最终结论，最终得分以评标委员会评审为准。
-        </p>
-        <div class="divide-y divide-slate-100">
-          <div v-for="(row, idx) in scoringIndex" :key="row.id" class="text-sm">
-            <button
-              type="button"
-              @click="toggleScore(row.id)"
-              class="w-full px-4 py-3 flex items-center gap-3 text-left hover:bg-emerald-50/40"
-            >
-              <component :is="expandedScoreIds.has(row.id) ? ChevronUp : ChevronDown" class="w-4 h-4 text-slate-400 flex-shrink-0" />
-              <span class="flex-shrink-0 text-xs font-mono text-slate-500 w-14">{{ row.code || idx + 1 }}</span>
-              <span class="flex-1 min-w-0">
-                <span class="font-medium text-slate-800">{{ row.name }}</span>
-                <span class="ml-2 text-xs text-slate-400">{{ row.category }}</span>
-              </span>
-              <span class="flex-shrink-0 text-xs text-slate-500 w-16 text-right">权重 {{ row.weight }}%</span>
-              <span class="flex-shrink-0 text-xs w-20 text-right">
-                <span :class="['font-bold', scoreCls(scoreRate(row.assessment?.score, row.fullScore), !!row.assessment)]">
-                  {{ row.assessment ? row.assessment.score : "待评分" }}
-                </span>
-                <span class="text-slate-400"> / {{ row.fullScore }}</span>
-              </span>
-            </button>
-            <div v-if="expandedScoreIds.has(row.id)" class="px-4 pb-4 pl-12 space-y-2 text-xs">
-              <p class="text-slate-600"><b class="text-slate-700">评分标准详细描述：</b>{{ row.description || "（以评分细则原文为准）" }}</p>
-              <p class="text-slate-600"><b class="text-slate-700">具体评分细则：</b>{{ row.rules || "（未抽取到细则原文）" }}</p>
-              <p class="text-slate-600"><b class="text-slate-700">招标文件对应条款：</b><span class="text-purple-600">{{ row.sourceClause || "未注明出处" }}</span></p>
-              <p v-if="row.assessment" class="text-slate-600">
-                <b class="text-slate-700">投标文件精确引用：</b>
-                {{ row.assessment.bidChapter || "未定位章节" }}
-                <template v-if="row.assessment.bidPage">　·　第 {{ row.assessment.bidPage }} 页</template>
-                <template v-if="row.assessment.bidParagraph">　·　{{ row.assessment.bidParagraph }}</template>
-              </p>
-              <p v-if="row.assessment?.criterionClause" class="text-slate-600">
-                <b class="text-slate-700">适用评分条款：</b>{{ row.assessment.criterionClause }}
-              </p>
-              <div v-if="row.assessment?.evidenceQuote"
-                class="bg-slate-50 border-l-2 border-emerald-500 px-3 py-2 text-slate-700 whitespace-pre-wrap rounded-r">
-                <b>投标文件引用原文（证据）：</b>{{ row.assessment.evidenceQuote }}
-              </div>
-              <p v-if="row.assessment" class="text-slate-600">
-                <b class="text-slate-700">评分依据与详细评分说明：</b>{{ row.assessment.explanation || "（未给出说明）" }}
-              </p>
-              <p v-if="row.assessment?.needManualCheck" class="text-amber-700 bg-amber-50 px-2 py-1 rounded">
-                ※ 该项证据或分值需人工复核后确认，当前得分不作为最终结论。
-              </p>
-            </div>
-          </div>
-        </div>
-        </template>
-      </div>
-
       <!-- 高危问题（准高危，非废标项） -->
       <div v-if="criticalIssues.length > 0" class="bg-white border border-red-200 rounded-lg overflow-hidden">
         <div class="bg-red-50 px-4 py-2.5 border-b border-red-200 flex items-center justify-between">
@@ -682,6 +611,78 @@ onMounted(() => {
         <ul class="list-disc list-inside text-sm text-yellow-800 space-y-1">
           <li v-for="(c, idx) in remediationPlan.manualCheck" :key="idx">{{ c }}</li>
         </ul>
+      </div>
+
+      <!-- 评分索引与逐项打分（可选增值内容，统一置于全部审查内容之后） -->
+      <div v-if="scoringIndex.length > 0 || isLlmMode" class="bg-white border border-emerald-200 rounded-lg overflow-hidden">
+        <div class="bg-emerald-50 px-4 py-2.5 border-b border-emerald-200 flex items-center justify-between flex-wrap gap-2">
+          <div class="flex items-center gap-2">
+            <FileCheck class="w-4 h-4 text-emerald-700" />
+            <h4 class="font-medium text-emerald-900">{{ secNo.scoring }}、评分索引与逐项打分</h4>
+          </div>
+          <div v-if="scoreTotal" class="text-xs text-emerald-800">
+            模拟评估总分：<b class="text-sm">{{ scoreTotal.got }} / {{ scoreTotal.full }}</b> 分（得分率 {{ scoreTotal.rate }}%）
+          </div>
+        </div>
+        <div v-if="scoringIndex.length === 0" class="px-4 py-4 bg-amber-50 border-l-4 border-amber-400 m-3 rounded">
+          <p class="text-sm font-medium text-amber-900">⚠ 未能自动抽取到结构化评分项，本章未完成逐项打分</p>
+          <p class="mt-1 text-xs text-amber-800 leading-relaxed">
+            系统已尝试定位招标文件中的评标办法/评分标准章节但未解析出可打分的评分项（常见原因：评分办法位于扫描图片页、分值表为复杂表格）。
+            请人工查阅招标文件评分办法章节，按原文分值表逐项对照投标文件评分；该事项已列入待人工核查清单。重新上传文字版招标文件后再次运行审核可自动完成本章。
+          </p>
+        </div>
+        <template v-else>
+        <p class="px-4 pt-2.5 text-xs text-slate-500">
+          严格依据招标文件评分办法原文构建，点击各评分项可展开评分细则、投标文件章节/页码/段落引用、证据原文与详细评分说明；标注"需人工复核"的项不作为最终结论，最终得分以评标委员会评审为准。
+        </p>
+        <div class="divide-y divide-slate-100">
+          <div v-for="(row, idx) in scoringIndex" :key="row.id" class="text-sm">
+            <button
+              type="button"
+              @click="toggleScore(row.id)"
+              class="w-full px-4 py-3 flex items-center gap-3 text-left hover:bg-emerald-50/40"
+            >
+              <component :is="expandedScoreIds.has(row.id) ? ChevronUp : ChevronDown" class="w-4 h-4 text-slate-400 flex-shrink-0" />
+              <span class="flex-shrink-0 text-xs font-mono text-slate-500 w-14">{{ row.code || idx + 1 }}</span>
+              <span class="flex-1 min-w-0">
+                <span class="font-medium text-slate-800">{{ row.name }}</span>
+                <span class="ml-2 text-xs text-slate-400">{{ row.category }}</span>
+              </span>
+              <span class="flex-shrink-0 text-xs text-slate-500 w-16 text-right">权重 {{ row.weight }}%</span>
+              <span class="flex-shrink-0 text-xs w-20 text-right">
+                <span :class="['font-bold', scoreCls(scoreRate(row.assessment?.score, row.fullScore), !!row.assessment)]">
+                  {{ row.assessment ? row.assessment.score : "待评分" }}
+                </span>
+                <span class="text-slate-400"> / {{ row.fullScore }}</span>
+              </span>
+            </button>
+            <div v-if="expandedScoreIds.has(row.id)" class="px-4 pb-4 pl-12 space-y-2 text-xs">
+              <p class="text-slate-600"><b class="text-slate-700">评分标准详细描述：</b>{{ row.description || "（以评分细则原文为准）" }}</p>
+              <p class="text-slate-600"><b class="text-slate-700">具体评分细则：</b>{{ row.rules || "（未抽取到细则原文）" }}</p>
+              <p class="text-slate-600"><b class="text-slate-700">招标文件对应条款：</b><span class="text-purple-600">{{ row.sourceClause || "未注明出处" }}</span></p>
+              <p v-if="row.assessment" class="text-slate-600">
+                <b class="text-slate-700">投标文件精确引用：</b>
+                {{ row.assessment.bidChapter || "未定位章节" }}
+                <template v-if="row.assessment.bidPage">　·　第 {{ row.assessment.bidPage }} 页</template>
+                <template v-if="row.assessment.bidParagraph">　·　{{ row.assessment.bidParagraph }}</template>
+              </p>
+              <p v-if="row.assessment?.criterionClause" class="text-slate-600">
+                <b class="text-slate-700">适用评分条款：</b>{{ row.assessment.criterionClause }}
+              </p>
+              <div v-if="row.assessment?.evidenceQuote"
+                class="bg-slate-50 border-l-2 border-emerald-500 px-3 py-2 text-slate-700 whitespace-pre-wrap rounded-r">
+                <b>投标文件引用原文（证据）：</b>{{ row.assessment.evidenceQuote }}
+              </div>
+              <p v-if="row.assessment" class="text-slate-600">
+                <b class="text-slate-700">评分依据与详细评分说明：</b>{{ row.assessment.explanation || "（未给出说明）" }}
+              </p>
+              <p v-if="row.assessment?.needManualCheck" class="text-amber-700 bg-amber-50 px-2 py-1 rounded">
+                ※ 该项证据或分值需人工复核后确认，当前得分不作为最终结论。
+              </p>
+            </div>
+          </div>
+        </div>
+        </template>
       </div>
     </template>
 

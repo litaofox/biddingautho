@@ -21,6 +21,8 @@ import {
   AUDIT_REQUIREMENTS_PROMPT,
   EXTRACT_SCORING_ITEMS_PROMPT,
   SCORE_BID_PROMPT,
+  OUTLINE_SUMMARY_PROMPT,
+  SCORING_MAP_PROMPT,
   buildAuditContext,
 } from "../llmEngine/auditPrompts.js";
 import {
@@ -1131,27 +1133,62 @@ export class LLMAugmenter {
     const BATCH = 3;
     const out: ScoringAssessment[] = [];
 
+    // 两遍法·第一遍：构建投标文件章节摘要索引（一次构建，全部评分项复用），
+    // 每章标题+内容节选分批让 LLM 概括，用于评分项↔章节的语义映射，
+    // 解决"章节名与评分项名不一致"时的证据漏配
+    const outline = await this.buildOutlineIndex(bidText);
+    if (outline.length > 0) {
+      console.log(`[LLM审核] 章节摘要索引：${outline.length} 个章节`);
+    }
+
     for (let i = 0; i < items.length; i += BATCH) {
       const batch = items.slice(i, i + BATCH);
-      const evidenceMap = await this.retrieveEvidenceBatch(
-        batch.map((it) => ({
-          name: it.name,
-          desc: `${it.description} ${it.rules}`,
-          keywords: extractScoringKeywords(it),
-        })),
-        bidText
-      );
+
+      // 阶段0a：本地按评分项名定位投标文件对应章节（免 LLM，命中即免检索）
+      const located = new Map<string, string>();
+      batch.forEach((it) => {
+        const section = locateScoringSection(bidText, it.name);
+        if (section) located.set(it.name, section);
+      });
+
+      // 阶段0b：未精确命中的评分项，用章节摘要索引做语义映射（每批一次调用）
+      const missingItems = batch.filter((it) => !located.has(it.name));
+      if (missingItems.length > 0 && outline.length > 0) {
+        const mapped = await this.mapScoringToOutline(missingItems, outline, bidText);
+        mapped.forEach((section, name) => {
+          if (section && !located.has(name)) located.set(name, section);
+        });
+      }
+
+      // 阶段0c：仍无章节证据的评分项走检索证据链路
+      const searchItems = batch.filter((it) => !located.has(it.name));
+      const evidenceMap = searchItems.length > 0
+        ? await this.retrieveEvidenceBatch(
+            searchItems.map((it) => ({
+              name: it.name,
+              desc: `${it.description} ${it.rules}`,
+              keywords: extractScoringKeywords(it),
+            })),
+            bidText
+          )
+        : {};
 
       const brief = batch
         .map((it, j) => `${j + 1}. 编号 ${it.code}｜[${it.category}] ${it.name}（满分 ${it.fullScore} 分）\n   评分标准：${it.description}\n   评分细则：${it.rules}\n   招标出处：${it.sourceClause || "未注明"}`)
         .join("\n\n");
+      // 证据策略：优先按评分项名定位投标文件对应章节全文（完整评估），
+      // 定位失败再降级到检索证据片段；两者都失败才标记未检索到
       const evidenceText = batch
         .map((it) => {
+          const section = located.get(it.name);
+          if (section) {
+            return `【评分项 ${it.code}】${it.name}\n投标文件对应章节全文：\n${section}`;
+          }
           const ev = evidenceMap[it.name] || [];
-          return `【评分项 ${it.code}】${it.name}\n${ev.length > 0 ? ev.map((e) => "· " + e).join("\n").slice(0, 2000) : "（未检索到直接证据）"}`;
+          return `【评分项 ${it.code}】${it.name}\n${ev.length > 0 ? ev.map((e) => "· " + e).join("\n").slice(0, 4000) : "（未检索到直接证据）"}`;
         })
         .join("\n\n")
-        .slice(0, 16000);
+        .slice(0, 26000);
 
       const userMsg =
         `${buildAuditContext(meta)}\n\n` +
@@ -1190,6 +1227,113 @@ export class LLMAugmenter {
     }
 
     return out;
+  }
+
+  /**
+   * 两遍法·第一遍：构建投标文件章节摘要索引
+   * 本地解析标题树（支持 一、/（一）/1. /1.1 /1.1.1/第X章 等编号体系，到三层及更深），
+   * 每个标题与其后内容构成章节条目；过滤目录行（内容过短）；分批让 LLM 生成摘要与关键词。
+   */
+  private async buildOutlineIndex(bidText: string): Promise<BidOutlineEntry[]> {
+    const headings = extractHeadingPositions(bidText);
+    const entries: BidOutlineEntry[] = [];
+    for (let i = 0; i < headings.length; i++) {
+      const h = headings[i];
+      const end = i + 1 < headings.length ? headings[i + 1].pos : bidText.length;
+      const contentLen = end - h.pos - h.len;
+      // 内容过短视为目录行/占位行，不进索引
+      if (contentLen < 200) continue;
+      entries.push({
+        title: h.line,
+        pos: h.pos,
+        end,
+        summary: "",
+        keywords: [],
+      });
+    }
+    if (entries.length === 0) return [];
+
+    // 分批摘要：每批 6 章、每章取内容前 1200 字，控制单次调用体积
+    const GROUP = 6;
+    const PREVIEW = 1200;
+    for (let i = 0; i < entries.length; i += GROUP) {
+      const group = entries.slice(i, i + GROUP);
+      const desc = group
+        .map((e, j) => {
+          const body = bidText.slice(e.pos + e.title.length, Math.min(e.end, e.pos + e.title.length + PREVIEW)).trim();
+          return `${j + 1}. 标题：${e.title}\n   内容节选：${body || "（空）"}`;
+        })
+        .join("\n\n");
+      const content = await this.callLLM(OUTLINE_SUMMARY_PROMPT, desc);
+      if (!content) continue;
+      try {
+        const arr = this.parseJSON(content);
+        if (!Array.isArray(arr)) continue;
+        arr.forEach((r: any, idx: number) => {
+          const e = group[Number(r?.idx) - 1] || group[idx];
+          if (!e) return;
+          e.summary = String(r?.summary || "").slice(0, 120);
+          e.keywords = Array.isArray(r?.keywords)
+            ? r.keywords.slice(0, 6).map((k: any) => String(k).slice(0, 20))
+            : [];
+        });
+      } catch {
+        // 摘要失败不影响索引本身（summary 留空，标题仍可用于映射）
+      }
+    }
+    return entries;
+  }
+
+  /**
+   * 两遍法·第二遍前置换：用章节摘要索引为未精确命中的评分项做语义映射，
+   * 返回 Map<评分项名, 章节全文>；映射命中后按标题位置取整章（≤8000字）。
+   */
+  private async mapScoringToOutline(
+    items: BidScoringItem[],
+    outline: BidOutlineEntry[],
+    bidText: string
+  ): Promise<Map<string, string>> {
+    const result = new Map<string, string>();
+    if (items.length === 0 || outline.length === 0) return result;
+
+    const indexText = outline
+      .map((e, i) => `${i + 1}. ${e.title}${e.summary ? ` —— ${e.summary}` : ""}${e.keywords.length > 0 ? `（关键词：${e.keywords.join("/")}）` : ""}`)
+      .join("\n");
+    const itemsText = items
+      .map((it, j) => `${j + 1}. code=${it.code}｜${it.name}（${it.category}）\n   评分细则：${(it.rules || it.description || "").slice(0, 300)}`)
+      .join("\n");
+
+    const content = await this.callLLM(
+      SCORING_MAP_PROMPT,
+      `评分项清单：\n${itemsText}\n\n投标文件章节摘要索引：\n${indexText}`
+    );
+    if (!content) return result;
+    try {
+      const arr = this.parseJSON(content);
+      if (!Array.isArray(arr)) return result;
+      for (const r of arr) {
+        const item = items.find((it) => String(it.code) === String(r?.code));
+        if (!item || result.has(item.name)) continue;
+        const sections: string[] = Array.isArray(r?.sections) ? r.sections : [];
+        // 取最相关章节的全文（按标题精确回查位置）
+        for (const sec of sections.slice(0, 2)) {
+          const want = String(sec).trim();
+          const entry =
+            outline.find((e) => e.title === want) ||
+            outline.find((e) => normalizeHeadingKey(e.title) === normalizeHeadingKey(want)) ||
+            outline.find((e) => normalizeHeadingKey(e.title).includes(normalizeHeadingKey(want)));
+          if (!entry) continue;
+          const section = bidText.slice(entry.pos, Math.min(entry.end, entry.pos + entry.title.length + 8000)).trim();
+          if (section.length >= 300) {
+            result.set(item.name, section);
+            break;
+          }
+        }
+      }
+    } catch {
+      // 映射失败返回空，调用方降级到检索证据
+    }
+    return result;
   }
 
   /**
@@ -1289,6 +1433,15 @@ function extractRequirementKeywords(r: ProcurementRequirement): string[] {
   return Array.from(new Set([...hintWords, ...phrases])).slice(0, 22);
 }
 
+/** 投标文件章节摘要索引条目（评分两遍法·第一遍产物） */
+interface BidOutlineEntry {
+  title: string; // 标题行（含编号）
+  pos: number; // 标题在 bidText 中的起始位置
+  end: number; // 章节内容结束位置（下一标题起始处）
+  summary: string; // LLM 概括的章节摘要
+  keywords: string[]; // 章节主题关键词
+}
+
 /** 从评分项中提取证据预筛关键词（评分项名 + 描述/细则短语） */
 function extractScoringKeywords(it: BidScoringItem): string[] {
   const phrases = `${it.category} ${it.name} ${it.description}`
@@ -1296,6 +1449,68 @@ function extractScoringKeywords(it: BidScoringItem): string[] {
     .map((s) => s.trim())
     .filter((s) => s.length >= 2 && s.length <= 14);
   return Array.from(new Set([it.name, it.category, ...phrases])).slice(0, 20);
+}
+
+/** 标题/评分项名的归一化 key：去空白、编号、标点，便于包含匹配 */
+function normalizeHeadingKey(s: string): string {
+  return s.replace(/[\s\d.．、（）()【】\[\]·\-—_]/g, "");
+}
+
+/**
+ * 提取投标文件中的标题行及位置（用于按评分项名定位对应章节）
+ * 标题行约束：短行（≤30字）、不含句读、带公文编号前缀（第X章/一、/（一）/1. 1.1）
+ */
+function extractHeadingPositions(text: string): { pos: number; len: number; line: string }[] {
+  const out: { pos: number; len: number; line: string }[] = [];
+  const re = /[^\n]+/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const line = m[0].trim();
+    if (line.length < 2 || line.length > 30) continue;
+    if (/[。，；？！]/.test(line)) continue;
+    if (
+      !/^第[一二三四五六七八九十百千\d]+[章节部分条]/.test(line) &&
+      !/^[一二三四五六七八九十]+[、.．]/.test(line) &&
+      !/^[（(][一二三四五六七八九十\d]+[)）]/.test(line) &&
+      !/^\d+(?:\.\d+){0,3}[、.．]?\s*\S/.test(line)
+    ) {
+      continue;
+    }
+    out.push({ pos: m.index, len: m[0].length, line });
+  }
+  return out;
+}
+
+/**
+ * 按评分项名在投标全文中定位对应章节（标题归一化后包含评分项名），
+ * 从命中标题切到下一个标题，多个命中（目录行/正文标题）取最长切片（正文）。
+ * 未命中或切片过短返回空串，由调用方降级到检索证据。
+ */
+function locateScoringSection(bidText: string, itemName: string, maxChars = 8000): string {
+  const key = normalizeHeadingKey(itemName);
+  if (!key || key.length < 3) return "";
+  const headings = extractHeadingPositions(bidText);
+  if (headings.length === 0) return "";
+  const hits = headings.filter((h) => normalizeHeadingKey(h.line).includes(key));
+  if (hits.length === 0) return "";
+  // 目录行与正文标题都会命中；正文切片远长于目录行之间的间隔，取最长者
+  const ends = hits.filter((h) => normalizeHeadingKey(h.line).endsWith(key));
+  const pool = ends.length > 0 ? ends : hits;
+  let best = "";
+  for (const hit of pool) {
+    let endPos = bidText.length;
+    for (const h of headings) {
+      if (h.pos > hit.pos + hit.len) {
+        endPos = h.pos;
+        break;
+      }
+    }
+    const slice = bidText
+      .slice(hit.pos, Math.min(endPos, hit.pos + hit.len + maxChars))
+      .trim();
+    if (slice.length > best.length) best = slice;
+  }
+  return best.length >= 300 ? best : "";
 }
 
 /**

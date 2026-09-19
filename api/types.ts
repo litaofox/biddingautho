@@ -182,6 +182,8 @@ export interface TaskLLMConfig {
   provider: string;
   apiKey: string;
   scope: string[];
+  /** 是否执行模拟打分（评分索引与逐项打分），默认启用；用户在第一步可取消勾选 */
+  simulateScoring?: boolean;
 }
 
 export interface Task {
