@@ -32,7 +32,6 @@ const remediationPlan = computed(() => result.value?.remediationPlan);
 const completeness = computed<CompletenessItem[]>(() => result.value?.completeness || []);
 const highlights = computed<Issue[]>(() => result.value?.highlights || []);
 const scoringIndex = computed(() => result.value?.scoringIndex || []);
-const isLlmMode = computed(() => result.value?.mode === "llm");
 
 // 问题分层：废标项（命中否决条款的 critical）单独分区暗红展示，其余按等级分区
 const rejectionIssues = computed<Issue[]>(() =>
@@ -56,8 +55,8 @@ const secNo = computed<Record<string, number>>(() => {
     ["highlights", highlights.value.length > 0],
     ["remediation", !!plan],
     ["manual", !!plan && plan.manualCheck.length > 0],
-    // 模拟打分为可选增值内容，统一置于全部审查内容之后（末章）
-    ["scoring", scoringIndex.value.length > 0 || isLlmMode.value],
+    // 模拟打分为可选增值内容，统一置于全部审查内容之后（末章）；无评分项时不渲染（避免出现空的占位章）
+    ["scoring", scoringIndex.value.length > 0],
   ];
   const map: Record<string, number> = {};
   let seq = 1; // 一、整体核查结论
@@ -613,8 +612,8 @@ onMounted(() => {
         </ul>
       </div>
 
-      <!-- 评分索引与逐项打分（可选增值内容，统一置于全部审查内容之后） -->
-      <div v-if="scoringIndex.length > 0 || isLlmMode" class="bg-white border border-emerald-200 rounded-lg overflow-hidden">
+      <!-- 评分索引与逐项打分（可选增值内容，统一置于全部审查内容之后；仅在有评分项时渲染） -->
+      <div v-if="scoringIndex.length > 0" class="bg-white border border-emerald-200 rounded-lg overflow-hidden">
         <div class="bg-emerald-50 px-4 py-2.5 border-b border-emerald-200 flex items-center justify-between flex-wrap gap-2">
           <div class="flex items-center gap-2">
             <FileCheck class="w-4 h-4 text-emerald-700" />

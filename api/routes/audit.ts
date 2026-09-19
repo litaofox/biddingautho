@@ -237,7 +237,9 @@ router.post("/auto", async (req: Request, res: Response) => {
     // 立即响应，后台异步执行
     res.json({ success: true, message: "已开始全自动审核" });
 
-    const doSimulateScoring = simulateScoring !== false; // 默认启用模拟打分
+    // 模拟打分功能总开关（暂时下线；恢复时改回 true 即可，引擎与展示层代码均保留）
+    const SIMULATE_SCORING_ENABLED = false;
+    const doSimulateScoring = SIMULATE_SCORING_ENABLED && simulateScoring !== false;
     const steps = [
       { key: "parse", label: "文件解析", status: "done" as const },
       { key: "plan", label: "AI 生成审核清单", status: "active" as const },

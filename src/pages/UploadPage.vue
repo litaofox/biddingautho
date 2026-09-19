@@ -33,7 +33,8 @@ const auditMode = ref<"local" | "llm">("local");
 const llmProvider = ref("qianwen");
 const llmApiKey = ref("");
 const llmRiskConfirmed = ref(false);
-// 模拟打分（评分索引与逐项打分），默认启用，用户可在第一步取消勾选
+// 模拟打分（评分索引与逐项打分）功能入口开关——暂时下线；恢复时改回 true 即可（后端有对应总开关）
+const SIMULATE_SCORING_ENABLED = false;
 const simulateScoring = ref(true);
 
 const procurementInput = ref<HTMLInputElement | null>(null);
@@ -132,7 +133,7 @@ async function handleStart() {
       await startLlmAutoAudit(uploadedSessionId.value, {
         provider: llmProvider.value,
         apiKey: llmApiKey.value.trim(),
-        simulateScoring: simulateScoring.value,
+        simulateScoring: SIMULATE_SCORING_ENABLED && simulateScoring.value,
       });
     }
 
@@ -368,7 +369,7 @@ function fileSize(f: File) {
               class="w-full bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-slate-700 placeholder-slate-400 focus:border-purple-500 outline-none text-sm disabled:bg-slate-100" />
           </div>
         </div>
-        <div class="flex items-center gap-2 pt-1">
+        <div v-if="SIMULATE_SCORING_ENABLED" class="flex items-center gap-2 pt-1">
           <input id="simulate-scoring" type="checkbox" v-model="simulateScoring" class="w-4 h-4 accent-emerald-600" />
           <label for="simulate-scoring" class="text-sm text-slate-700 cursor-pointer select-none">
             模拟打分<span class="text-xs text-slate-400">（依据招标文件评分办法逐项对照投标文件打分并估算总分，结果展示在报告末章；默认启用）</span>

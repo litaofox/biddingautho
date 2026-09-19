@@ -82,8 +82,8 @@ function sectionNumbers(
     ["highlights", options.highlights !== false && (result.highlights || []).length > 0],
     ["remediation", options.remediation !== false],
     ["manual", options.manualCheck !== false && (result.remediationPlan?.manualCheck || []).length > 0],
-    // 模拟打分为可选增值内容，统一置于全部审查内容之后（末章）
-    ["scoring", (result.scoringIndex || []).length > 0 || result.mode === "llm"],
+    // 模拟打分为可选增值内容，统一置于全部审查内容之后（末章）；无评分项时不渲染（避免出现空的占位章）
+    ["scoring", (result.scoringIndex || []).length > 0],
   ];
   const out: Partial<Record<SecKey, number>> = {};
   let seq = 0;
