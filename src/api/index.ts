@@ -2,7 +2,7 @@
 import type {
   ReviewConfig, ReviewItem, ReviewItemSet, UnifiedReviewResult,
   MultiDimConfig, MultiDimReviewResult,
-  Issue, RemediationPlan, CompletenessItem, AuditPlan,
+  Issue, RemediationPlan, CompletenessItem, AuditPlan, AuditProgress,
 } from "../types";
 
 const BASE_URL = "/api";
@@ -178,6 +178,7 @@ export async function getRemediationPlan(sessionId: string): Promise<{
   highlights: Issue[];
   issues: Issue[];
   bidders: string[];
+  scoringIndex?: MultiDimReviewResult["scoringIndex"];
   mode: string;
   procurement: string;
   createdAt: number;
@@ -254,4 +255,39 @@ export async function runLlmAudit(sessionId: string): Promise<MultiDimReviewResu
   const json = await res.json();
   if (!json.success) throw new Error(json.error);
   return json.result;
+}
+
+// ========== 一键全自动审核（上传后选择审核方式） ==========
+
+// 一键 LLM 全自动审核（生成清单→自动确认→逐维度审查），后台异步执行
+export async function startLlmAutoAudit(
+  sessionId: string,
+  data: { provider: string; apiKey: string }
+): Promise<void> {
+  const res = await fetch(`${BASE_URL}/audit/auto`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionId, ...data }),
+  });
+  const json = await res.json();
+  if (!json.success) throw new Error(json.error);
+}
+
+// 一键本地检查（规则引擎），后台异步执行
+export async function startLocalAutoAudit(sessionId: string): Promise<void> {
+  const res = await fetch(`${BASE_URL}/review2/multi-dim/auto`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionId }),
+  });
+  const json = await res.json();
+  if (!json.success) throw new Error(json.error);
+}
+
+// 轮询审核进度
+export async function getAuditProgress(sessionId: string): Promise<AuditProgress | null> {
+  const res = await fetch(`${BASE_URL}/audit/progress/${sessionId}`);
+  const json = await res.json();
+  if (!json.success) throw new Error(json.error);
+  return json.progress;
 }

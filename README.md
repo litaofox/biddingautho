@@ -1,5 +1,88 @@
-# Vue 3 + TypeScript + Vite
+# 投标书智能审查系统
 
-This template should help get you started developing with Vue 3 and TypeScript in Vite. The template uses Vue 3 `<script setup>` SFCs, check out the [script setup docs](https://v3.vuejs.org/api/sfc-script-setup.html#sfc-script-setup) to learn more.
+面向政府采购/招投标场景的投标文件智能审查 Web 应用：上传招标文件与 1-5 家投标文件，自动完成**完整性对照、多维度问题扫描、评分标准逐项打分、废标风险定性**，生成带证据引用与整改清单的审查报告，支持导出离线 HTML。
 
-Learn more about the recommended Project Setup and IDE Support in the [Vue Docs TypeScript Guide](https://vuejs.org/guide/typescript/overview.html#project-setup).
+## 功能特性
+
+- **双轨审核模式**
+  - 本地规则审核（离线可用）：关键词/章节/正则匹配做符合性检查
+  - LLM 全自动审核（v2.0 主模式）：九维度问题扫描 + 评分模拟打分 + 要求覆盖比对
+- **评分索引与逐项打分**：自动定位招标文件评分办法章节，抽取评分项并逐项对照投标文件打分，估算总分；抽取失败时保留章节占位并列入人工核查
+- **废标红线机制**：多处报价不一致（大写错漏字/大小写不符/总价≠合计/一处一价）等命中否决条款的问题，强制定级为废标项，报告中以独立暗红分区置顶展示
+- **事实校验层**：对 LLM 结论做日期断言校验与证据原文溯源（金额/引文强 token 定位 + 滑窗探测），拦截"当前年份错误"类幻觉
+- **问题去重与整改清单**：跨环节重复问题自动合并；P0/P1/P2 优先级整改清单 + 待人工核查清单
+- **动态章节编号报告**：双端（HTML 报告/前端页面）章节结构一致，缺章自动顺延编号
+- **多格式解析**：.doc/.docx（mammoth + LibreOffice 转换）、PDF（pdf-parse 文本层 + tesseract.js OCR 兜底）
+- **无数据库**：任务数据存于服务端内存，API Key 不持久化
+
+## 技术栈
+
+| 层 | 技术 |
+|----|------|
+| 前端 | Vue 3 + TypeScript + Vite + Tailwind CSS |
+| 后端 | Node.js + Express + tsx（nodemon 热重载） |
+| 解析 | mammoth.js / LibreOffice / pdf-parse / tesseract.js（内置 chi_sim、eng 语言包） |
+| LLM | 统一适配层：OpenAI / 百度千帆 / 智谱 GLM / 本地兼容模型（用户自带 API Key） |
+| 报告 | 后端渲染内联 CSS 的独立 HTML，离线可打开 |
+
+## 快速开始
+
+```bash
+# 安装依赖
+npm install
+
+# 同时启动前端(5173)与后端(3001)
+npm run dev
+
+# 或分别启动
+npm run client:dev   # 前端 vite
+npm run server:dev   # 后端 nodemon
+
+# 类型检查（vue-tsc 同时覆盖前后端）
+npm run check
+```
+
+打开 http://localhost:5173 → 上传招标文件与投标文件 → 选择审核模式（LLM 模式需在界面配置服务商与 API Key，仅存于内存）→ 查看进度与审查结果 → 勾选章节导出 HTML 报告。
+
+## 审查报告章节结构
+
+```
+一、整体核查结论
+二、废标风险项（命中否决条款，暗红分区，存在时才渲染）
+三、投标文件完整性对照表
+四、评分索引与逐项打分（LLM 模式）
+五、高危问题（一票否决风险项）
+六、评标扣分问题
+七、细节优化问题
+八、合规亮点梳理
+九、最终整改清单（P0/P1/P2）
+十、待补充核查
+```
+
+## 目录结构
+
+```
+api/
+  parsers/        # Word/PDF/OCR 文本解析
+  llm/            # LLM 统一适配层与抽取/审查调用
+  llmEngine/      # v2.0 审核引擎：多维批审/感知摘要/事实校验/废标红线/整改
+  engine/         # 本地规则审核引擎
+  report/         # HTML 报告渲染（multiDimReport）
+  routes/         # 上传/审查/导出接口
+src/
+  pages/          # 上传/进度/结果/导出页面
+  api/            # 前端 API 封装
+```
+
+## 设计文档
+
+完整设计方案与架构演进见 [投标书审查系统-设计与开发计划.md](./投标书审查系统-设计与开发计划.md)，其中：
+
+- 第一~七章：v1.x 需求分析、架构、UI、实现路径、测试与风险
+- 第八章：v2.0 LLM 多维审核体系（审核流水线、招标文件感知摘要引擎、废标红线层、事实校验层、通用性约束与格式适应机制）
+
+## 注意事项
+
+- 审查数据与 API Key 仅存于服务端内存，服务重启后失效，需重新上传审查
+- 开启 LLM 模式后文件文本将发送至所选服务商，敏感标书建议使用本地兼容模型
+- 扫描件 PDF 依赖 OCR，复杂表格/图片页的评分标准可能无法自动抽取（报告会显式提示人工核查）

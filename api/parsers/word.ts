@@ -6,6 +6,90 @@ import { exec } from "child_process";
 import { promises as fs } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
+import { ocrImage, formatOcrText } from "./ocr.js";
+
+/**
+ * HTML 实体解码表
+ */
+const HTML_ENTITIES: Record<string, string> = {
+  "&nbsp;": " ", "&amp;": "&", "&lt;": "<", "&gt;": ">",
+  "&quot;": '"', "&#39;": "'", "&#34;": '"',
+  "&ldquo;": '"', "&rdquo;": '"', "&lsquo;": "'", "&rsquo;": "'",
+  "&mdash;": "—", "&ndash;": "–", "&hellip;": "…",
+};
+
+function decodeHtmlEntities(text: string): string {
+  return text.replace(/&[a-zA-Z#0-9]+;/g, (m) => HTML_ENTITIES[m] || m);
+}
+
+/**
+ * 将单个表格的 HTML 内部内容转换为结构化纯文本
+ * 每行格式：| 单元格1 | 单元格2 | ...
+ * 单元格内的换行（<br> / 换行符）替换为 " / "，避免列错位
+ */
+function tableToStructuredText(tableInner: string): string {
+  const rows: string[] = [];
+  const trRegex = /<tr\b[^>]*>([\s\S]*?)<\/tr>/gi;
+  let trMatch: RegExpExecArray | null;
+  while ((trMatch = trRegex.exec(tableInner)) !== null) {
+    const rowInner = trMatch[1];
+    const cells: string[] = [];
+    const cellRegex = /<t[dh]\b[^>]*>([\s\S]*?)<\/t[dh]>/gi;
+    let cellMatch: RegExpExecArray | null;
+    while ((cellMatch = cellRegex.exec(rowInner)) !== null) {
+      let cellText = cellMatch[1];
+      // 单元格内换行统一替换为 " / "，保留同一单元格的多行内容
+      cellText = cellText.replace(/<br\s*\/?>/gi, " / ");
+      cellText = cellText.replace(/\r?\n/g, " / ");
+      // 去掉单元格内其他 HTML 标签
+      cellText = cellText.replace(/<[^>]+>/g, "");
+      cellText = decodeHtmlEntities(cellText);
+      // 合并连续的分隔符和多余空白
+      cellText = cellText.replace(/(?:\s*\/\s*)+/g, " / ");
+      cellText = cellText.replace(/[ \t]+/g, " ").trim();
+      cells.push(cellText);
+    }
+    if (cells.length > 0) {
+      rows.push("| " + cells.join(" | ") + " |");
+    }
+  }
+  return rows.join("\n");
+}
+
+/**
+ * 将 mammoth 输出的 HTML 转换为结构化纯文本
+ * 核心改进：
+ * 1. 表格保留行列结构（| 列 | 列 |），单元格内换行用 " / " 替代
+ * 2. 图片的 OCR 文字（存于 alt 属性）提取为 [图片内容：...]，插入文本流
+ * 3. 非表格部分去除 HTML 标签，保留段落换行
+ */
+function htmlToStructuredText(html: string): string {
+  // 1. 提取所有 <table>，转换为结构化文本并占位
+  let processed = html.replace(/<table\b[^>]*>([\s\S]*?)<\/table>/gi, (_match, tableInner) => {
+    const tableText = tableToStructuredText(tableInner);
+    return `\n【表格】\n${tableText}\n【表格结束】\n`;
+  });
+
+  // 2. 提取 <img alt="OCR文字">，把 OCR 结果插入文本流
+  processed = processed.replace(/<img\b[^>]*\balt="([^"]*)"[^>]*>/gi, (_match, alt) => {
+    const text = decodeHtmlEntities(String(alt || "")).trim();
+    return text ? `\n${formatOcrText(text)}\n` : "";
+  });
+  // 没有 alt 的 img 直接移除
+  processed = processed.replace(/<img\b[^>]*>/gi, "");
+
+  // 3. 非表格部分：块级标签转换行，再去掉所有标签
+  processed = processed.replace(/<br\s*\/?>/gi, "\n");
+  processed = processed.replace(/<\/(p|div|h[1-6]|li|tr)>/gi, "\n");
+  processed = processed.replace(/<[^>]+>/g, "");
+
+  // 4. 解码实体 + 清理空白
+  processed = decodeHtmlEntities(processed);
+  processed = processed.replace(/[ \t]+\n/g, "\n");
+  processed = processed.replace(/\n{3,}/g, "\n\n");
+
+  return processed.trim();
+}
 
 /**
  * 判断是否为 .doc 文件（非 .docx）
@@ -22,21 +106,106 @@ function isPdfFile(fileName: string): boolean {
 }
 
 /**
- * 解析 PDF 文件，提取纯文本
- * 使用 pdf-parse 库，从 Buffer 直接读取
- *
- * 注意：pdf-parse 1.1.1 的 index.js 中有 isDebugMode = !module.parent 的逻辑，
- * 在 ESM import() 下 module.parent 为 undefined，会触发尝试加载
- * ./test/data/05-versions-space.pdf（通常不存在）并报错。
- * 因此直接从 lib/pdf-parse.js 加载，绕过 index.js 的测试文件逻辑。
+ * 解析 PDF 文件，提取纯文本 + 图片 OCR 文字
+ * 1. pdf-parse 提取文本层（含简易表格结构还原）
+ * 2. pdfjs-dist 提取嵌入图片，用 OCR 识别截图内容（如信用查询截图）
+ *    将 OCR 文字以 [图片内容：...] 形式拼接到文本流
  */
 async function parsePdf(buffer: Buffer, fileName: string): Promise<{ text: string }> {
-  // 直接加载 lib 实现，避免触发 index.js 的 isDebugMode 加载测试文件
   const createRequire = (await import("module")).createRequire;
   const require = createRequire(import.meta.url);
   const pdfParse = require("pdf-parse/lib/pdf-parse.js");
   const data = await pdfParse(buffer, { max: 0 });
-  return { text: (data && data.text) || "" };
+  let text = (data && data.text) || "";
+  text = normalizePdfTables(text);
+
+  // 提取 PDF 中的嵌入图片并 OCR
+  try {
+    const imageTexts = await extractPdfImagesAndOcr(buffer);
+    if (imageTexts.length > 0) {
+      text += "\n\n【PDF 图片内容】\n" + imageTexts.map(formatOcrText).join("\n");
+    }
+  } catch (err) {
+    console.warn("[PDF] 图片提取/OCR 失败，跳过:", err instanceof Error ? err.message : err);
+  }
+
+  return { text };
+}
+
+/**
+ * 用 pdfjs-dist 提取 PDF 中所有嵌入图片，逐张 OCR，返回识别文字数组
+ */
+async function extractPdfImagesAndOcr(pdfBuffer: Buffer): Promise<string[]> {
+  // Node.js 环境需使用 pdfjs-dist 的 legacy 构建
+  const pdfjs: typeof import("pdfjs-dist") = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  const pdf = await pdfjs.getDocument({ data: new Uint8Array(pdfBuffer) }).promise;
+  const texts: string[] = [];
+  const seen = new Set<string>();
+
+  for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+    const page = await pdf.getPage(pageNum);
+    const operatorList = await page.getOperatorList();
+    const fnArray = operatorList.fnArray;
+    const argsArray = operatorList.argsArray;
+
+    for (let i = 0; i < fnArray.length; i++) {
+      const fn = fnArray[i];
+      // 图片绘制操作：paintImageXObject / paintJpegXObject / paintInlineImageXObject
+      if (
+        fn === pdfjs.OPS.paintImageXObject ||
+        fn === pdfjs.OPS.paintJpegXObject ||
+        fn === pdfjs.OPS.paintInlineImageXObject
+      ) {
+        const objName = argsArray[i][0];
+        try {
+          const img = (page.objs as any).get(objName);
+          if (!img || !img.data || !img.width || !img.height) continue;
+          // 去重：相同尺寸+数据长度的图片只识别一次
+          const key = `${img.width}x${img.height}-${img.data.length}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+
+          // 构造 ImageData 兼容对象传给 tesseract
+          const imageData = {
+            data: new Uint8ClampedArray(img.data),
+            width: img.width,
+            height: img.height,
+          };
+          const ocrText = await ocrImage(imageData as any);
+          if (ocrText) texts.push(ocrText);
+        } catch {
+          // 单个图片提取失败不影响其他
+        }
+      }
+    }
+  }
+  await pdf.destroy();
+  return texts;
+}
+
+/**
+ * 简易 PDF 表格还原：
+ * 将一行中 2 个及以上制表符 / 3 个及以上连续空格视为列分隔符，
+ * 统一替换为 " | "，帮助 LLM 识别列结构。
+ */
+function normalizePdfTables(text: string): string {
+  return text
+    .split(/\r?\n/)
+    .map((line) => {
+      // 制表符分隔 → " | "
+      if (line.includes("\t")) {
+        const parts = line.split("\t").map((s) => s.trim()).filter((s) => s.length > 0);
+        if (parts.length >= 2) return "| " + parts.join(" | ") + " |";
+      }
+      // 3 个及以上连续空格分隔 → " | "
+      const multiSpace = / {3,}/;
+      if (multiSpace.test(line)) {
+        const parts = line.split(multiSpace).map((s) => s.trim()).filter((s) => s.length > 0);
+        if (parts.length >= 2) return "| " + parts.join(" | ") + " |";
+      }
+      return line;
+    })
+    .join("\n");
 }
 
 /**
@@ -105,9 +274,22 @@ export async function parseDocx(buffer: Buffer, fileName: string): Promise<Uploa
       displayName = fileName.replace(/\.doc$/i, ".docx");
     }
 
-    // 使用 mammoth 提取纯文本
-    const result = await mammoth.extractRawText({ buffer: parseBuffer });
-    rawText = result.value;
+    // 使用 mammoth 转换为 HTML，再由 htmlToStructuredText 保留表格结构
+    // convertImage 拦截文档中的图片，用 OCR 识别文字并写入 alt 属性，
+    // htmlToStructuredText 会把 alt 提取为 [图片内容：...] 插入文本流
+    const result = await mammoth.convertToHtml(
+      { buffer: parseBuffer },
+      {
+        convertImage: mammoth.images.imgElement((image) => {
+          return image.read().then(async (imageBuffer: Buffer) => {
+            const ocrText = await ocrImage(imageBuffer);
+            // alt 存 OCR 文字，src 用占位（后续会被剥离）
+            return { src: "image-placeholder", alt: ocrText };
+          });
+        }),
+      }
+    );
+    rawText = htmlToStructuredText(result.value);
   }
 
   // 按章节结构化

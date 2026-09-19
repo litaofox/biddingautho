@@ -3,7 +3,8 @@
 import type {
   ReviewConfig, ReviewItem, RejectionItem, ScoringItem,
   AuditPlan, AuditCheckpoint, Issue, IssueDimension, RiskLevel,
-  CompletenessItem,
+  CompletenessItem, ProcurementRequirement, ProjectMeta,
+  BidScoringItem, ScoringAssessment,
 } from "../types.js";
 import {
   EXTRACT_REVIEW_DIMENSIONS_PROMPT,
@@ -17,7 +18,16 @@ import {
   GENERATE_AUDIT_PLAN_PROMPT,
   AUDIT_BATCH_PROMPT,
   AUDIT_COMPLETENESS_PROMPT,
+  AUDIT_REQUIREMENTS_PROMPT,
+  EXTRACT_SCORING_ITEMS_PROMPT,
+  SCORE_BID_PROMPT,
+  buildAuditContext,
 } from "../llmEngine/auditPrompts.js";
+import {
+  buildPlanDigest,
+  buildScoringDigest,
+  buildFormatDigest,
+} from "../llmEngine/procurementDigest.js";
 
 /**
  * 文本脱敏：在发送到外部 LLM 前替换敏感身份信息
@@ -778,26 +788,28 @@ export class LLMAugmenter {
   // ========== 全方位审核（九大维度，两阶段） ==========
 
   /**
-   * 阶段一：根据采购文件 + 项目需求生成动态审核清单
+   * 阶段一：根据采购文件 + 项目需求生成动态审核清单 + 采购要求逐条清单
    * 返回 null 表示 LLM 未返回可解析结果
    */
   async generateAuditPlan(
     procurementText: string,
     projectReqText?: string
   ): Promise<AuditPlan | null> {
-    const combined = (procurementText || "") + "\n" + (projectReqText || "");
+    // 章节感知摘要：避免盲截前 3 万字丢失中后部的服务要求/评分办法/格式清单
+    const digest = buildPlanDigest(procurementText || "", 30000);
+    const combined = digest + "\n" + (projectReqText || "").slice(0, 8000);
     if (!combined.trim()) return null;
 
     const content = await this.callLLM(
-      GENERATE_AUDIT_PLAN_PROMPT,
-      combined.slice(0, 30000)
+      buildAuditContext() + "\n\n" + GENERATE_AUDIT_PLAN_PROMPT,
+      combined
     );
     if (!content) return null;
 
     try {
       const parsed = this.parseJSON(content);
       const rawMeta = (parsed && parsed.meta) || {};
-      const meta = {
+      const meta: ProjectMeta = {
         projectName: String(rawMeta.projectName || "未命名项目").slice(0, 120),
         projectCode: rawMeta.projectCode ? String(rawMeta.projectCode).slice(0, 80) : undefined,
         purchaser: rawMeta.purchaser ? String(rawMeta.purchaser).slice(0, 80) : undefined,
@@ -828,7 +840,21 @@ export class LLMAugmenter {
         }));
 
       if (checkpoints.length === 0) return null;
-      return { meta, checkpoints, generatedAt: ts };
+
+      // 采购要求逐条清单（用于后续"要求-响应"全覆盖比对）
+      const rawReqs: any[] = Array.isArray(parsed.requirements) ? parsed.requirements : [];
+      const requirements: ProcurementRequirement[] = rawReqs
+        .filter((r) => r && r.content)
+        .slice(0, 50)
+        .map((r, idx) => ({
+          id: `req_${idx}_${ts}`,
+          category: r.category ? String(r.category).slice(0, 40) : "采购要求",
+          content: String(r.content).slice(0, 400),
+          mandatory: Boolean(r.mandatory),
+          sourceClause: r.sourceClause ? String(r.sourceClause).slice(0, 160) : "",
+        }));
+
+      return { meta, checkpoints, requirements, generatedAt: ts };
     } catch (err) {
       console.warn("[LLM] generateAuditPlan: JSON parse failed", err instanceof Error ? err.message : err);
       return null;
@@ -844,7 +870,8 @@ export class LLMAugmenter {
   async auditDimensionBatch(
     dimension: IssueDimension,
     checkpoints: AuditCheckpoint[],
-    bidText: string
+    bidText: string,
+    meta?: ProjectMeta | null
   ): Promise<Issue[]> {
     if (checkpoints.length === 0 || !bidText.trim()) return [];
 
@@ -877,6 +904,7 @@ export class LLMAugmenter {
     }
 
     const userMsg =
+      `${buildAuditContext(meta)}\n\n` +
       `本批审核维度：${dimension}\n\n` +
       `招标审核要点：\n${brief}\n\n` +
       `投标文件证据片段：\n${evidenceText}`;
@@ -900,34 +928,268 @@ export class LLMAugmenter {
 
   /**
    * 补充：投标文件格式完整性对照 + 待人工核验清单
+   *
+   * 关键：
+   * 1. 投标文件可能很长，先提取全部章节标题作为"目录索引"前置，避免截断导致误判缺失；
+   * 2. 采购文件的实际格式清单（formatDigest）由调用方章节感知抽取后传入，对照以采购文件为准。
    */
   async auditCompleteness(
-    bidText: string
+    bidText: string,
+    formatDigest?: string,
+    meta?: ProjectMeta | null
   ): Promise<{ completeness: CompletenessItem[]; manualCheck: string[] }> {
     if (!bidText.trim()) return { completeness: [], manualCheck: [] };
-    const content = await this.callLLM(AUDIT_COMPLETENESS_PROMPT, bidText.slice(0, 20000));
+
+    // 提取所有章节标题行，作为目录索引前置
+    const headings = extractHeadings(bidText);
+    const catalog = headings.length > 0
+      ? `【投标文件章节目录】\n${headings.join("\n")}\n【目录结束】\n\n`
+      : "";
+    const procurementList = formatDigest
+      ? `【采购文件规定的投标文件格式/组成清单（原文摘录）】\n${formatDigest}\n【清单结束】\n\n`
+      : `【采购文件规定的投标文件格式/组成清单】\n（未抽取到独立格式章节，请依据投标文件目录可见材料核查）\n\n`;
+    const fullInput =
+      `${buildAuditContext(meta)}\n\n` +
+      procurementList +
+      catalog +
+      bidText;
+
+    const content = await this.callLLM(AUDIT_COMPLETENESS_PROMPT, fullInput.slice(0, 24000));
     if (!content) return { completeness: [], manualCheck: [] };
     try {
       const parsed = this.parseJSON(content);
       const rawList: any[] = Array.isArray(parsed.completeness) ? parsed.completeness : [];
       const completeness: CompletenessItem[] = rawList
         .filter((c) => c && c.formatName)
-        .slice(0, 20)
+        .slice(0, 30)
         .map((c) => ({
           formatId: String(c.formatId || "").slice(0, 10),
           formatName: String(c.formatName).slice(0, 60),
+          required: c.required === "optional" ? "optional" : "required",
           fileName: c.fileName ? String(c.fileName).slice(0, 120) : "",
           status: ["complete", "partial", "missing"].includes(c.status) ? c.status : "partial",
           remark: c.remark ? String(c.remark).slice(0, 200) : undefined,
         }));
       const manualCheck: string[] = Array.isArray(parsed.manualCheck)
-        ? parsed.manualCheck.map((s: unknown) => String(s)).filter(Boolean).slice(0, 15)
+        ? parsed.manualCheck.map((s: unknown) => String(s)).filter(Boolean).slice(0, 20)
         : [];
       return { completeness, manualCheck };
     } catch (err) {
       console.warn("[LLM] auditCompleteness parse failed", err instanceof Error ? err.message : err);
       return { completeness: [], manualCheck: [] };
     }
+  }
+
+  /**
+   * 采购要求逐条覆盖比对（治理"服务承诺等要求存在但未被审查出来"的漏检问题）
+   * 对 plan.requirements 逐条检索投标证据，仅输出未响应/空泛响应/弱响应问题
+   */
+  async auditRequirementsCoverage(
+    requirements: ProcurementRequirement[],
+    bidText: string,
+    meta?: ProjectMeta | null
+  ): Promise<Issue[]> {
+    const reqs = (requirements || []).filter((r) => r.content.trim());
+    if (reqs.length === 0 || !bidText.trim()) return [];
+
+    // 分批，每批 6 条要求，先做证据检索
+    const BATCH = 6;
+    const all: Issue[] = [];
+    const ts = Date.now();
+
+    for (let i = 0; i < reqs.length; i += BATCH) {
+      const batch = reqs.slice(i, i + BATCH);
+      const evidenceMap = await this.retrieveEvidenceBatch(
+        batch.map((r) => ({
+          name: r.content.slice(0, 30),
+          desc: `${r.category}：${r.content}${r.mandatory ? "（强制性要求）" : ""}`,
+          keywords: extractRequirementKeywords(r),
+        })),
+        bidText
+      );
+
+      const brief = batch
+        .map((r, j) => `${j + 1}. [${r.mandatory ? "强制" : "一般"}][${r.category}] ${r.content}（出处：${r.sourceClause || "未注明"}）`)
+        .join("\n");
+      const evidenceText = batch
+        .map((r) => {
+          const ev = evidenceMap[r.content.slice(0, 30)] || [];
+          return `【要求】${r.content}\n${ev.length > 0 ? ev.map((e) => "· " + e).join("\n").slice(0, 1400) : "（未检索到直接证据）"}`;
+        })
+        .join("\n\n")
+        .slice(0, 14000);
+
+      const userMsg =
+        `${buildAuditContext(meta)}\n\n` +
+        `采购要求清单：\n${brief}\n\n` +
+        `投标文件证据片段：\n${evidenceText}`;
+
+      const content = await this.callLLM(AUDIT_REQUIREMENTS_PROMPT, userMsg);
+      if (!content) continue;
+      try {
+        const arr = this.parseJSON(content);
+        if (!Array.isArray(arr)) continue;
+        arr
+          .filter((x: any) => x && (x.name || x.description))
+          .slice(0, BATCH)
+          .forEach((x: any, idx: number) => {
+            all.push(normalizeIssue(x, "substantive", i + idx, ts + i + idx));
+          });
+      } catch (err) {
+        console.warn("[LLM] auditRequirementsCoverage parse failed", err instanceof Error ? err.message : err);
+      }
+    }
+
+    return all.slice(0, 40);
+  }
+
+  /**
+   * 从招标文件评分办法抽取结构化评分项（严格忠于原文）
+   * 权重在服务端按分值复核重算，避免模型算术错误
+   */
+  async extractScoringItems(
+    procurementText: string,
+    projectReqText?: string
+  ): Promise<{ items: BidScoringItem[]; totalScore: number }> {
+    if (!procurementText || !procurementText.trim()) return { items: [], totalScore: 0 };
+
+    // 第一次：评分章节感知摘要（14k）；为空则第二次扩大窗口（24k）重试，覆盖评分办法位于中后段的情况
+    const digests = [
+      buildScoringDigest(procurementText, 14000),
+      buildScoringDigest(procurementText, 24000),
+    ];
+    const extra = (projectReqText || "").slice(0, 4000);
+
+    let parsed: any = null;
+    for (let attempt = 0; attempt < digests.length; attempt++) {
+      const digest = digests[attempt];
+      const combined = digest + "\n" + extra;
+      if (!combined.trim()) continue;
+      const content = await this.callLLM(
+        buildAuditContext() + "\n\n" + EXTRACT_SCORING_ITEMS_PROMPT,
+        combined
+      );
+      if (!content) continue;
+      try {
+        parsed = this.parseJSON(content);
+        const list: any[] = Array.isArray(parsed.items) ? parsed.items : [];
+        if (list.length > 0) break; // 抽到评分项即停止重试
+        console.warn(`[LLM] extractScoringItems 第${attempt + 1}次尝试返回 0 项（digest ${digest.length} 字）`);
+      } catch (err) {
+        console.warn(
+          `[LLM] extractScoringItems 第${attempt + 1}次 JSON 解析失败`,
+          err instanceof Error ? err.message : err
+        );
+      }
+    }
+
+    if (!parsed) return { items: [], totalScore: 0 };
+    try {
+      const rawList: any[] = Array.isArray(parsed.items) ? parsed.items : [];
+      const ts = Date.now();
+      const items: BidScoringItem[] = rawList
+        .filter((x) => x && x.name && Number.isFinite(Number(x.fullScore)) && Number(x.fullScore) > 0)
+        .slice(0, 40)
+        .map((x, idx) => ({
+          id: `score_${idx}_${ts}`,
+          code: x.code ? String(x.code).slice(0, 20) : String(idx + 1),
+          name: String(x.name).slice(0, 80),
+          category: x.category ? String(x.category).slice(0, 30) : "评分项",
+          description: String(x.description || "").slice(0, 500),
+          fullScore: Math.round(Number(x.fullScore) * 10) / 10,
+          weight: Number(x.weight) || 0,
+          rules: String(x.rules || "").slice(0, 800),
+          sourceClause: x.sourceClause ? String(x.sourceClause).slice(0, 160) : "",
+        }));
+
+      // 服务端复核权重：优先用评分项分值合计，其次模型给的总分
+      const sumScore = items.reduce((s, x) => s + x.fullScore, 0);
+      const base = sumScore > 0 ? sumScore : Number(parsed.totalScore) || 0;
+      if (base > 0) {
+        items.forEach((x) => {
+          x.weight = Math.round((x.fullScore / base) * 1000) / 10;
+        });
+      }
+      console.log(`[LLM] 评分项抽取成功：${items.length} 项，总分 ${base || "未知"}`);
+      return { items, totalScore: base };
+    } catch (err) {
+      console.warn("[LLM] extractScoringItems 结果映射失败", err instanceof Error ? err.message : err);
+      return { items: [], totalScore: 0 };
+    }
+  }
+
+  /**
+   * 依据评分项对投标文件逐项打分（证据检索 + LLM 引用原文打分，结果可追溯）
+   */
+  async scoreBidItems(
+    items: BidScoringItem[],
+    bidText: string,
+    meta?: ProjectMeta | null
+  ): Promise<ScoringAssessment[]> {
+    if (items.length === 0 || !bidText.trim()) return [];
+
+    const BATCH = 3;
+    const out: ScoringAssessment[] = [];
+
+    for (let i = 0; i < items.length; i += BATCH) {
+      const batch = items.slice(i, i + BATCH);
+      const evidenceMap = await this.retrieveEvidenceBatch(
+        batch.map((it) => ({
+          name: it.name,
+          desc: `${it.description} ${it.rules}`,
+          keywords: extractScoringKeywords(it),
+        })),
+        bidText
+      );
+
+      const brief = batch
+        .map((it, j) => `${j + 1}. 编号 ${it.code}｜[${it.category}] ${it.name}（满分 ${it.fullScore} 分）\n   评分标准：${it.description}\n   评分细则：${it.rules}\n   招标出处：${it.sourceClause || "未注明"}`)
+        .join("\n\n");
+      const evidenceText = batch
+        .map((it) => {
+          const ev = evidenceMap[it.name] || [];
+          return `【评分项 ${it.code}】${it.name}\n${ev.length > 0 ? ev.map((e) => "· " + e).join("\n").slice(0, 2000) : "（未检索到直接证据）"}`;
+        })
+        .join("\n\n")
+        .slice(0, 16000);
+
+      const userMsg =
+        `${buildAuditContext(meta)}\n\n` +
+        `评分项与评分细则：\n${brief}\n\n` +
+        `投标文件证据片段：\n${evidenceText}`;
+
+      const content = await this.callLLM(SCORE_BID_PROMPT, userMsg);
+      if (!content) continue;
+      try {
+        const arr = this.parseJSON(content);
+        if (!Array.isArray(arr)) continue;
+        batch.forEach((it, idx) => {
+          const found =
+            arr.find((x: any) => String(x.code) === String(it.code)) || arr[idx] || null;
+          if (!found) return;
+          const rawScore = Number(found.score);
+          const score = Number.isFinite(rawScore)
+            ? Math.min(it.fullScore, Math.max(0, Math.round(rawScore * 10) / 10))
+            : 0;
+          out.push({
+            itemId: it.id,
+            score,
+            maxScore: it.fullScore,
+            bidChapter: found.bidChapter ? String(found.bidChapter).slice(0, 120) : "",
+            bidPage: Number.isInteger(Number(found.bidPage)) ? Number(found.bidPage) : undefined,
+            bidParagraph: found.bidParagraph ? String(found.bidParagraph).slice(0, 160) : "",
+            criterionClause: found.criterionClause ? String(found.criterionClause).slice(0, 400) : "",
+            evidenceQuote: found.evidenceQuote ? String(found.evidenceQuote).slice(0, 300) : "",
+            explanation: found.explanation ? String(found.explanation).slice(0, 500) : "",
+            needManualCheck: Boolean(found.needManualCheck),
+          });
+        });
+      } catch (err) {
+        console.warn("[LLM] scoreBidItems parse failed", err instanceof Error ? err.message : err);
+      }
+    }
+
+    return out;
   }
 
   /**
@@ -1004,6 +1266,71 @@ function extractAuditKeywords(name: string, requirement: string, dimension: Issu
   parts.forEach((p) => set.add(p));
   (DIM_KEYWORDS[dimension] || []).forEach((k) => set.add(k));
   return Array.from(set).slice(0, 24);
+}
+
+/** 从采购要求中提取证据预筛关键词（类别词 + 要求中的短语切分） */
+function extractRequirementKeywords(r: ProcurementRequirement): string[] {
+  const categoryHints: Record<string, string[]> = {
+    服务: ["服务", "响应", "到场", "驻场", "时限", "承诺", "保障", "应急", "巡检"],
+    商务: ["报价", "付款", "有效期", "承诺", "保证金", "发票", "合同"],
+    技术: ["方案", "技术", "系统", "设备", "功能", "指标", "部署", "安全"],
+    人员: ["人员", "资质", "证书", "职称", "资历", "配备", "驻场"],
+    质保: ["质保", "保修", "售后", "维护", "免费", "年限"],
+    培训: ["培训", "授课", "教材", "考核"],
+    验收: ["验收", "标准", "交付", "成果"],
+  };
+  const hintWords = Object.entries(categoryHints)
+    .filter(([k]) => r.category.includes(k) || r.content.includes(k))
+    .flatMap(([, v]) => v);
+  const phrases = `${r.category} ${r.content}`
+    .split(/[，。；：、,.;:（）()\[\]【】\s/／|""''""'']+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length >= 2 && s.length <= 14);
+  return Array.from(new Set([...hintWords, ...phrases])).slice(0, 22);
+}
+
+/** 从评分项中提取证据预筛关键词（评分项名 + 描述/细则短语） */
+function extractScoringKeywords(it: BidScoringItem): string[] {
+  const phrases = `${it.category} ${it.name} ${it.description}`
+    .split(/[，。；：、,.;:（）()\[\]【】\s/／|""''""'']+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length >= 2 && s.length <= 14);
+  return Array.from(new Set([it.name, it.category, ...phrases])).slice(0, 20);
+}
+
+/**
+ * 从投标文件全文中提取所有章节标题行，作为完整性检查的目录索引
+ * 匹配：第X章、一、二、（一）、1. 2. 等编号开头的行
+ */
+function extractHeadings(text: string): string[] {
+  const lines = text.split(/\r?\n/);
+  const headings: string[] = [];
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line || line.length > 80) continue;
+    // 第X章/第X条/第X部分
+    if (/^第[一二三四五六七八九十百千\d]+[章节条部分款]/.test(line)) {
+      headings.push(line);
+      continue;
+    }
+    // 一、二、三、（中文数字+顿号）
+    if (/^[一二三四五六七八九十]+、/.test(line)) {
+      headings.push(line);
+      continue;
+    }
+    // （一）（二）中文括号数字
+    if (/^[（(][一二三四五六七八九十]+[）)]/.test(line)) {
+      headings.push(line);
+      continue;
+    }
+    // 1. 2. 3. 阿拉伯数字+点
+    if (/^\d+[.、]/.test(line)) {
+      headings.push(line);
+      continue;
+    }
+  }
+  // 去重保序
+  return Array.from(new Set(headings));
 }
 
 function toPositiveIntOrUndefined(v: unknown): number | undefined {

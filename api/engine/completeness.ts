@@ -50,6 +50,7 @@ export function runCompletenessCheck(
     items.push({
       formatId: fmt.id,
       formatName: fmt.name,
+      required: "required",
       fileName: foundFile || "(未提供)",
       status,
       remark: found ? "已提供" : "投标文件未检索到对应内容",

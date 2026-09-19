@@ -2,54 +2,68 @@
 import { ref } from "vue";
 import { ShieldCheck } from "lucide-vue-next";
 import UploadPage from "@/pages/UploadPage.vue";
-import ConfigPage from "@/pages/ConfigPage.vue";
-import ResultPage from "@/pages/ResultPage.vue";
+import AuditProgressPage from "@/pages/AuditProgressPage.vue";
 import RemediationPage from "@/pages/RemediationPage.vue";
-import ExportPage from "@/pages/ExportPage.vue";
-import type { UnifiedReviewResult, ReviewMode } from "@/types";
+import { startLlmAutoAudit, startLocalAutoAudit } from "@/api";
+import type { ReviewMode } from "@/types";
 
 const currentStep = ref(0);
 const sessionId = ref<string>("");
-const reviewResult = ref<UnifiedReviewResult | null>(null);
 const reviewMode = ref<ReviewMode>("local");
+// 最近一次审核启动配置（用于失败后无需重新上传即可重试）
+const auditConfig = ref<{ provider: string; apiKey: string }>({ provider: "qianwen", apiKey: "" });
+// 进度页实例标识：重试时自增强制重新挂载并重新轮询
+const progressRunId = ref(0);
+// 上传页实例标识：重新审查时自增强制清空已选文件与配置
+const uploadFormKey = ref(0);
 
 const steps = [
   { name: "文件上传", color: "cyan" },
-  { name: "审查配置", color: "magenta" },
-  { name: "审查结果", color: "green" },
-  { name: "多维审核", color: "magenta" },
-  { name: "报告导出", color: "cyan" },
+  { name: "智能审核", color: "magenta" },
+  { name: "审核结果", color: "green" },
 ];
 
-function nextStep() {
-  if (currentStep.value < steps.length - 1) currentStep.value++;
-}
-function prevStep() {
-  if (currentStep.value > 0) currentStep.value--;
-}
 function restart() {
   currentStep.value = 0;
   sessionId.value = "";
-  reviewResult.value = null;
   reviewMode.value = "local";
+  uploadFormKey.value++;
 }
-function onUploaded(sid: string) {
-  sessionId.value = sid;
-  nextStep();
+
+// 上传页一次点击完成上传+启动 → 进入进度页
+function onStartAudit(payload: {
+  sessionId: string;
+  mode: ReviewMode;
+  provider?: string;
+  apiKey?: string;
+}) {
+  sessionId.value = payload.sessionId;
+  reviewMode.value = payload.mode;
+  auditConfig.value = {
+    provider: payload.provider || "qianwen",
+    apiKey: payload.apiKey || "",
+  };
+  progressRunId.value++;
+  currentStep.value = 1;
 }
-function onReviewed(result: UnifiedReviewResult) {
-  reviewResult.value = result;
-  reviewMode.value = result.mode;
-  nextStep();
+
+// 失败重试：用相同配置重新发起审核，并重挂载进度页
+async function onRetry() {
+  try {
+    if (reviewMode.value === "llm") {
+      await startLlmAutoAudit(sessionId.value, auditConfig.value);
+    } else {
+      await startLocalAutoAudit(sessionId.value);
+    }
+    progressRunId.value++;
+  } catch {
+    // 启动失败时进度页会在下一次轮询读到 error 进度；此处忽略
+  }
 }
-// LLM 模式两阶段审查完成：结果已是 MultiDimReviewResult，直接进入多维审核页（跳过符合性结果页）
-function onLlmAudited() {
-  reviewMode.value = "llm";
-  currentStep.value = 3;
-}
-// 多维审核页返回：LLM 模式回到审查配置（无符合性结果页），本地模式回到符合性结果页
-function onRemediationBack() {
-  currentStep.value = reviewMode.value === "llm" ? 1 : 2;
+
+// 审核全部完成 → 结构化结果页
+function onAuditDone() {
+  currentStep.value = 2;
 }
 
 const colorMap: Record<string, string> = {
@@ -113,58 +127,36 @@ const colorMap: Record<string, string> = {
 
     <!-- 主内容区 -->
     <main class="flex-1 container px-6 py-8">
-      <transition name="fade" mode="out-in">
-        <UploadPage v-if="currentStep === 0" @uploaded="onUploaded" />
-        <ConfigPage
-          v-else-if="currentStep === 1"
-          :session-id="sessionId"
-          @reviewed="onReviewed"
-          @llm-audited="onLlmAudited"
-          @back="prevStep"
-        />
-        <ResultPage
-          v-else-if="currentStep === 2"
-          :result="reviewResult"
-          @next="nextStep"
-          @back="prevStep"
-        />
-        <RemediationPage
-          v-else-if="currentStep === 3"
-          :session-id="sessionId"
-          @next="nextStep"
-          @back="onRemediationBack"
-        />
-        <ExportPage
-          v-else
-          :session-id="sessionId"
-          :result="reviewResult"
-          :mode="reviewMode"
-          @back="prevStep"
-          @restart="restart"
-        />
-      </transition>
+      <!-- 上传页始终保活（v-show），返回时已选文件与审核方式配置不丢失；
+           重新审查时通过 :key 重挂载实现整体清空 -->
+      <UploadPage
+        v-show="currentStep === 0"
+        :key="`upload-${uploadFormKey}`"
+        @start-audit="onStartAudit"
+      />
+      <AuditProgressPage
+        v-if="currentStep === 1"
+        :key="`progress-${progressRunId}`"
+        :session-id="sessionId"
+        :mode="reviewMode"
+        @done="onAuditDone"
+        @back="currentStep = 0"
+        @retry="onRetry"
+      />
+      <RemediationPage
+        v-else-if="currentStep === 2"
+        :session-id="sessionId"
+        :mode="reviewMode"
+        @back="currentStep = 0"
+        @restart="restart"
+      />
     </main>
 
     <!-- 页脚 -->
     <footer class="border-t border-slate-200 py-4 text-center bg-white">
       <p class="text-xs text-slate-400">
-        © 2026 投标书智能审查系统 · 规则引擎 + 可选 LLM 增强 · 数据仅存内存
+        © 2026 投标书智能审查系统 · 本地规则引擎 / LLM 智能审核 · 数据仅存内存
       </p>
     </footer>
   </div>
 </template>
-
-<style scoped>
-.fade-enter-active,
-.fade-leave-active {
-  transition: opacity 0.3s ease, transform 0.3s ease;
-}
-.fade-enter-from {
-  opacity: 0;
-  transform: translateY(10px);
-}
-.fade-leave-to {
-  opacity: 0;
-  transform: translateY(-10px);
-}
-</style>

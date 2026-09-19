@@ -203,6 +203,8 @@ export interface Task {
   auditPlan?: AuditPlan;
   // LLM 模式：审核清单阶段使用的配置快照
   auditLlmConfig?: TaskLLMConfig;
+  // 一键审核执行进度（前端轮询）
+  auditProgress?: AuditProgress;
 }
 
 // ========== 多维审核模块类型（F1-F10） ==========
@@ -262,6 +264,10 @@ export interface Issue {
   basis?: string;
   /** 整改方案 */
   remediation?: string;
+  /** 系统事实校验标记：date-disputed=日期断言与事实基准矛盾；evidence-unverified=证据原文未能在投标文件中复核 */
+  factFlag?: "date-disputed" | "evidence-unverified";
+  /** 废标红线标记：命中招标文件否决条款（如多处报价不一致），展示层单独分区并以废标定性 */
+  rejection?: boolean;
   /** 整改优先级（自动从 riskLevel 推导，可手动覆盖） */
   priority?: "P0" | "P1" | "P2";
 }
@@ -270,14 +276,80 @@ export interface Issue {
 export interface CompletenessItem {
   /** 格式编号（一~十二） */
   formatId: string;
-  /** 格式名称 */
+  /** 格式名称（文件名称） */
   formatName: string;
-  /** 对应投标文件 */
+  /** 要求提交状态：required=采购文件要求必交，optional=选交/按需提供 */
+  required: "required" | "optional";
+  /** 对应投标文件位置/文件名（未提供留空） */
   fileName: string;
-  /** 状态 */
+  /** 实际提交与完整性检查结果：complete=已提交且完整、partial=已提交但有缺项、missing=未提交/缺失 */
   status: "complete" | "partial" | "missing";
-  /** 备注 */
+  /** 备注（缺项明细、核验说明等） */
   remark?: string;
+}
+
+/** 采购文件中逐条抽取的实质性/服务类要求（用于"要求-响应"覆盖比对） */
+export interface ProcurementRequirement {
+  id: string;
+  /** 要求类别：服务要求/商务要求/技术要求/资格要求等（按采购文件原章节归类） */
+  category: string;
+  /** 要求内容（原文或贴近原文的逐条表述） */
+  content: string;
+  /** 是否强制性（★/否决/加粗/"必须"等标注） */
+  mandatory: boolean;
+  /** 采购文件出处条款（章节号/条款号/页码） */
+  sourceClause: string;
+}
+
+/** 招标文件评分办法中抽取的单个评分项（第三章评分索引） */
+export interface BidScoringItem {
+  id: string;
+  /** 评分项编号（严格沿用招标文件编号，如"1.1""二-3"） */
+  code: string;
+  /** 评分项名称 */
+  name: string;
+  /** 评分大类（价格/技术/商务/资信等） */
+  category: string;
+  /** 评分标准详细描述 */
+  description: string;
+  /** 该项满分分值 */
+  fullScore: number;
+  /** 权重占比（百分比） */
+  weight: number;
+  /** 具体评分细则（分档/扣分规则原文） */
+  rules: string;
+  /** 招标文件出处（章节/条款/页码） */
+  sourceClause: string;
+}
+
+/** 针对单个评分项的投标响应打分结果（可追溯） */
+export interface ScoringAssessment {
+  /** 对应 BidScoringItem.id */
+  itemId: string;
+  /** 评定得分 */
+  score: number;
+  /** 满分 */
+  maxScore: number;
+  /** 投标文件对应章节标题 */
+  bidChapter: string;
+  /** 页码（仅在原文明确出现时填写，否则留空） */
+  bidPage?: number;
+  /** 段落/小节定位 */
+  bidParagraph?: string;
+  /** 评分标准对应条款（评分细则中适用的档/条） */
+  criterionClause: string;
+  /** 引用的投标文件具体内容（逐字摘录） */
+  evidenceQuote: string;
+  /** 评分说明：得分理由与对照过程 */
+  explanation: string;
+  /** 是否需人工复核（主观评审分/证据不足） */
+  needManualCheck: boolean;
+}
+
+/** 评分索引条目：评分项 + 对该投标人的打分结果 */
+export interface ScoringIndexEntry extends BidScoringItem {
+  /** 打分结果（可能因证据不足缺失） */
+  assessment?: ScoringAssessment;
 }
 
 /** 整改清单 */
@@ -302,6 +374,8 @@ export interface MultiDimReviewResult {
   issues: Issue[];
   /** 完整性对照表 */
   completeness: CompletenessItem[];
+  /** 第三章：评分索引与逐项打分（严格依据招标文件评分标准） */
+  scoringIndex?: ScoringIndexEntry[];
   /** 合规亮点 */
   highlights: Issue[];
   /** 整改清单 */
@@ -312,6 +386,10 @@ export interface MultiDimReviewResult {
     majorCount: number;
     minorCount: number;
     highlightCount: number;
+    /** 模拟评分合计（评分索引存在时） */
+    estimatedScore?: number;
+    /** 模拟评分满分合计 */
+    estimatedFullScore?: number;
     /** 整体风险 */
     overallRisk: "high" | "medium" | "low";
     /** 综合结论 */
@@ -364,6 +442,26 @@ export interface AuditPlan {
   meta: ProjectMeta;
   /** 审核要点（九大维度） */
   checkpoints: AuditCheckpoint[];
+  /** 从采购文件逐条抽取的要求清单（服务/商务/技术等），用于"要求-响应"覆盖比对 */
+  requirements?: ProcurementRequirement[];
   /** 生成时间戳 */
   generatedAt: number;
+}
+
+/** 审核执行进度（前端轮询展示） */
+export interface AuditProgress {
+  /** running 进行中 / done 完成 / error 失败 */
+  status: "running" | "done" | "error";
+  /** 0-100 百分比 */
+  percent: number;
+  /** 当前环节标识 */
+  stage: string;
+  /** 当前环节中文说明 */
+  message: string;
+  /** 已完成的环节步骤列表 */
+  steps: { key: string; label: string; status: "pending" | "active" | "done" }[];
+  /** 失败时的错误信息 */
+  error?: string;
+  /** 更新时间戳 */
+  updatedAt: number;
 }

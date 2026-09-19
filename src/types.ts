@@ -161,16 +161,45 @@ export interface Issue {
   evidence?: string;
   basis?: string;
   remediation?: string;
+  factFlag?: "date-disputed" | "evidence-unverified";
+  /** 废标红线标记：命中招标文件否决条款（如多处报价不一致），展示层单独分区并以废标定性 */
+  rejection?: boolean;
   priority?: "P0" | "P1" | "P2";
 }
 
-/** 完整性对照项（F8） */
+/** 完整性对照项 */
 export interface CompletenessItem {
   formatId: string;
   formatName: string;
+  required: "required" | "optional";
   fileName: string;
   status: "complete" | "partial" | "missing";
   remark?: string;
+}
+
+/** 招标文件评分项 + 投标响应打分（评分索引表） */
+export interface ScoringIndexEntry {
+  id: string;
+  code: string;
+  name: string;
+  category: string;
+  description: string;
+  fullScore: number;
+  weight: number;
+  rules: string;
+  sourceClause: string;
+  assessment?: {
+    itemId: string;
+    score: number;
+    maxScore: number;
+    bidChapter: string;
+    bidPage?: number;
+    bidParagraph?: string;
+    criterionClause: string;
+    evidenceQuote: string;
+    explanation: string;
+    needManualCheck: boolean;
+  };
 }
 
 /** 整改清单 */
@@ -187,6 +216,7 @@ export interface MultiDimReviewResult {
   bidders: string[];
   issues: Issue[];
   completeness: CompletenessItem[];
+  scoringIndex?: ScoringIndexEntry[];
   highlights: Issue[];
   remediationPlan: RemediationPlan;
   summary: {
@@ -194,6 +224,8 @@ export interface MultiDimReviewResult {
     majorCount: number;
     minorCount: number;
     highlightCount: number;
+    estimatedScore?: number;
+    estimatedFullScore?: number;
     overallRisk: "high" | "medium" | "low";
     conclusion: string;
   };
@@ -234,5 +266,23 @@ export interface AuditCheckpoint {
 export interface AuditPlan {
   meta: ProjectMeta;
   checkpoints: AuditCheckpoint[];
+  requirements?: {
+    id: string;
+    category: string;
+    content: string;
+    mandatory: boolean;
+    sourceClause: string;
+  }[];
   generatedAt: number;
+}
+
+/** 审核执行进度（轮询） */
+export interface AuditProgress {
+  status: "running" | "done" | "error";
+  percent: number;
+  stage: string;
+  message: string;
+  steps: { key: string; label: string; status: "pending" | "active" | "done" }[];
+  error?: string;
+  updatedAt: number;
 }

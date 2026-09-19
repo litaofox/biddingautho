@@ -94,11 +94,99 @@ router.get("/remediation/:sessionId", (req: Request, res: Response) => {
   highlights: task.multiDimResult.highlights,
   issues: task.multiDimResult.issues,
   bidders: task.multiDimResult.bidders,
+  scoringIndex: task.multiDimResult.scoringIndex,
   mode: task.multiDimResult.mode,
   procurement: task.procurement.name,
   createdAt: task.createdAt,
   generatedAt: Date.now(),
   } as const);
+});
+
+/**
+ * POST /api/review2/multi-dim/auto
+ * 一键本地检查：接口立即响应，后台执行规则引擎多维审核，进度写入 task.auditProgress
+ * 前端统一通过 GET /api/audit/progress/:sessionId 轮询
+ */
+router.post("/multi-dim/auto", async (req: Request, res: Response) => {
+  try {
+    const { sessionId } = req.body as { sessionId: string };
+    const task = getTask(sessionId);
+    if (!task) {
+      return res.status(404).json({ success: false, error: "会话不存在或已过期" });
+    }
+    if (!task.procurement) {
+      return res.status(400).json({ success: false, error: "缺少采购文件，无法执行多维审核" });
+    }
+    if (task.bidders.length === 0) {
+      return res.status(400).json({ success: false, error: "没有投标文件" });
+    }
+    if (task.auditProgress?.status === "running") {
+      return res.status(409).json({ success: false, error: "审核正在进行中，请勿重复提交" });
+    }
+
+    res.json({ success: true, message: "已开始本地检查" });
+
+    const steps = [
+      { key: "parse", label: "文件解析", status: "done" as const },
+      { key: "audit", label: "规则引擎逐项合规检查", status: "active" as const },
+      { key: "completeness", label: "完整性对照检查", status: "pending" as const },
+      { key: "remediation", label: "生成整改清单与审核结论", status: "pending" as const },
+      { key: "done", label: "检查完成", status: "pending" as const },
+    ];
+    const stepOf = (stage: string, status: "active" | "done") =>
+      steps.map((s, i) => {
+        const idx = steps.findIndex((x) => x.key === stage);
+        return { ...s, status: i < idx ? "done" : i === idx ? status : ("pending" as const) };
+      });
+
+    (async () => {
+      try {
+        updateTask(sessionId, {
+          auditProgress: {
+            status: "running",
+            percent: 15,
+            stage: "audit",
+            message: "规则引擎正在逐项检查资格、实质性条款、签章、数据一致性…",
+            steps: stepOf("audit", "active"),
+            updatedAt: Date.now(),
+          },
+        });
+
+        const result = await runMultiDimReview(task.bidders, task.procurement, { mode: "local" });
+        updateTask(sessionId, { multiDimResult: result, reviewMode: "local" });
+
+        updateTask(sessionId, {
+          auditProgress: {
+            status: "done",
+            percent: 100,
+            stage: "done",
+            message: "本地检查全部完成，正在为您整理结果…",
+            steps: steps.map((s) => ({ ...s, status: "done" as const })),
+            updatedAt: Date.now(),
+          },
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "本地检查失败";
+        console.error("[multi-dim auto] error:", err);
+        const cur = getTask(sessionId)?.auditProgress;
+        updateTask(sessionId, {
+          auditProgress: {
+            status: "error",
+            percent: cur?.percent || 0,
+            stage: cur?.stage || "unknown",
+            message: "检查失败",
+            steps: cur?.steps || steps,
+            error: msg,
+            updatedAt: Date.now(),
+          },
+        });
+      }
+    })();
+  } catch (err) {
+    console.error("[multi-dim auto] error:", err);
+    const msg = err instanceof Error ? err.message : "启动本地检查失败";
+    res.status(500).json({ success: false, error: msg });
+  }
 });
 
 /**
